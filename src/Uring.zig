@@ -44,21 +44,9 @@ const timestampFromPosix = Io.Threaded.timestampFromPosix;
 const unexpectedErrno = std.posix.unexpectedErrno;
 const winsize = std.posix.winsize;
 
-const tracy = if (@hasDecl(@import("root"), "tracy")) @import("root").tracy else struct {
-    const enable = false;
-    inline fn fiberEnter(fiber: [*:0]const u8) void {
-        _ = fiber;
-    }
-    inline fn fiberLeave() void {}
-};
-
 /// Empirically saw >128KB being used by the self-hosted backend to panic.
 /// Empirically saw glibc complain about 256KB.
 const idle_stack_size = 512 * 1024;
-
-const max_idle_search = 1;
-const max_steal_ready_search = 2;
-const max_steal_free_search = 4;
 
 backing_allocator_needs_mutex: bool,
 backing_allocator_mutex: Io.Mutex,
@@ -67,8 +55,7 @@ backing_allocator: Allocator,
 main_fiber_buffer: [
     std.mem.alignForward(usize, @sizeOf(Fiber), @alignOf(Completion)) + @sizeOf(Completion)
 ]u8 align(@max(@alignOf(Fiber), @alignOf(Completion))),
-log2_ring_entries: u4,
-threads: Thread.List,
+thread: Thread,
 sync_limit: ?Io.Semaphore,
 
 stderr_writer_initialized: bool = false,
@@ -91,21 +78,16 @@ random_fd: CachedFd,
 csprng_mutex: Io.Mutex,
 csprng: Csprng,
 
+allocated_slice: []align(@alignOf(Thread)) u8,
+
 op_getsockname_supported: bool = true,
 
 const Thread = struct {
-    required_align: void align(4),
-    thread: std.Thread,
     idle_context: Io.fiber.Context,
     current_context: *Io.fiber.Context,
     ready_queue: ?*Fiber,
     free_queue: ?*Fiber,
     io_uring: IoUring,
-    idle_search_index: u32,
-    steal_ready_search_index: u32,
-    steal_free_search_index: u32,
-    name_arena: if (tracy.enable) std.heap.ArenaAllocator.State else struct {},
-    csprng: Csprng,
 
     threadlocal var self: ?*Thread = null;
 
@@ -140,12 +122,6 @@ const Thread = struct {
             else => |e| @panic(@errorName(e)),
         };
     }
-
-    const List = struct {
-        allocated: []Thread,
-        reserved: u32,
-        active: u32,
-    };
 };
 
 const Fiber = struct {
@@ -162,9 +138,6 @@ const Fiber = struct {
     },
     cancel_status: CancelStatus,
     cancel_protection: CancelProtection,
-    name: if (tracy.enable) [*:0]const u8 else void,
-
-    var next_name: u64 = 0;
 
     const CancelStatus = packed struct(u32) {
         requested: bool,
@@ -279,27 +252,6 @@ const Fiber = struct {
             @atomicStore(?*Fiber, &thread.free_queue, free_fiber.status.free_next, .release);
             return free_fiber;
         }
-        const active_threads = @atomicLoad(u32, &ev.threads.active, .acquire);
-        for (0..@min(max_steal_free_search, active_threads)) |_| {
-            defer thread.steal_free_search_index += 1;
-            if (thread.steal_free_search_index == active_threads) thread.steal_free_search_index = 0;
-            const steal_free_search_thread =
-                &ev.threads.allocated[0..active_threads][thread.steal_free_search_index];
-            if (steal_free_search_thread == thread) continue;
-            const free_fiber =
-                @atomicLoad(?*Fiber, &steal_free_search_thread.free_queue, .monotonic) orelse continue;
-            if (free_fiber == finished) continue;
-            if (@cmpxchgWeak(
-                ?*Fiber,
-                &steal_free_search_thread.free_queue,
-                free_fiber,
-                null,
-                .acquire,
-                .monotonic,
-            )) |_| continue;
-            @atomicStore(?*Fiber, &thread.free_queue, free_fiber.status.free_next, .release);
-            return free_fiber;
-        }
         @atomicStore(?*Fiber, &thread.free_queue, null, .monotonic);
         return @ptrCast(try ev.allocator().alignedAlloc(u8, .of(Fiber), allocation_size));
     }
@@ -372,7 +324,7 @@ const Fiber = struct {
                 // so propagate the cancelation to the group.
                 if (fiber.status.awaiting_group.cancel(ev, null)) {
                     fiber.status = .{ .queue_next = null };
-                    _ = ev.schedule(.current(), .{ .head = fiber, .tail = fiber });
+                    ev.schedule(.current(), .{ .head = fiber, .tail = fiber });
                 }
             },
             _ => |awaiting| {
@@ -813,12 +765,7 @@ pub const InitOptions = struct {
 };
 
 pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !void {
-    const threads_size = @sizeOf(Thread) * if (options.thread_limit) |thread_limit|
-        1 + thread_limit
-    else
-        @max(std.Thread.getCpuCount() catch 1, 1);
-    const idle_stack_end_offset =
-        std.mem.alignForward(usize, threads_size + idle_stack_size, std.heap.pageSize());
+    const idle_stack_end_offset = std.mem.alignForward(usize, idle_stack_size, std.heap.pageSize());
     const allocated_slice = try backing_allocator.alignedAlloc(u8, .of(Thread), idle_stack_end_offset);
     errdefer backing_allocator.free(allocated_slice);
     ev.* = .{
@@ -826,12 +773,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .backing_allocator_mutex = .init,
         .backing_allocator = backing_allocator,
         .main_fiber_buffer = undefined,
-        .log2_ring_entries = options.log2_ring_entries,
-        .threads = .{
-            .allocated = @ptrCast(allocated_slice[0..threads_size]),
-            .reserved = 1,
-            .active = 1,
-        },
+        .thread = undefined,
         .sync_limit = if (options.sync_limit.toInt()) |sync_limit| .{ .permits = sync_limit } else null,
 
         .stderr_writer_initialized = false,
@@ -853,6 +795,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
 
         .csprng_mutex = .init,
         .csprng = .uninitialized,
+        .allocated_slice = allocated_slice,
     };
     const main_fiber: *Fiber = @ptrCast(&ev.main_fiber_buffer);
     main_fiber.* = .{
@@ -862,13 +805,10 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .status = .{ .queue_next = null },
         .cancel_status = .unrequested,
         .cancel_protection = .unblocked,
-        .name = if (tracy.enable) "main task",
     };
-    const main_thread = &ev.threads.allocated[0];
+    const main_thread = &ev.thread;
     Thread.self = main_thread;
     main_thread.* = .{
-        .required_align = {},
-        .thread = undefined,
         .idle_context = switch (builtin.cpu.arch) {
             .aarch64 => .{
                 .sp = @intFromPtr(allocated_slice[idle_stack_end_offset..].ptr),
@@ -891,73 +831,31 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .ready_queue = null,
         .free_queue = null,
         .io_uring = try .init(
-            @as(u16, 1) << ev.log2_ring_entries,
+            @as(u16, 1) << options.log2_ring_entries,
             linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER,
         ),
-        .idle_search_index = 1,
-        .steal_ready_search_index = 1,
-        .steal_free_search_index = 1,
-        .name_arena = .{},
-        .csprng = .uninitialized,
     };
     errdefer main_thread.io_uring.deinit();
-    if (tracy.enable) tracy.fiberEnter(main_fiber.name);
 }
 
 pub fn deinit(ev: *Evented) void {
     const main_fiber: *Fiber = @ptrCast(&ev.main_fiber_buffer);
     assert(Thread.current().currentFiber() == main_fiber);
-    const active_threads = @atomicLoad(u32, &ev.threads.active, .acquire);
-    for (ev.threads.allocated[0..active_threads]) |*thread| {
-        const ready_fiber = @atomicLoad(?*Fiber, &thread.ready_queue, .monotonic);
-        assert(ready_fiber == null or ready_fiber == Fiber.finished); // pending async
-    }
-    ev.yield(null, .exit);
-    ev.null_fd.close();
-    ev.random_fd.close();
-    const allocated_ptr: [*]align(@alignOf(Thread)) u8 = @ptrCast(@alignCast(ev.threads.allocated.ptr));
-    const idle_stack_end_offset = std.mem.alignForward(
-        usize,
-        ev.threads.allocated.len * @sizeOf(Thread) + idle_stack_size,
-        std.heap.pageSize(),
-    );
-    for (ev.threads.allocated[1..active_threads]) |*thread| thread.thread.join();
-    for (ev.threads.allocated[0..active_threads]) |*thread| thread.deinit(ev.backing_allocator);
-    assert(active_threads == ev.threads.active); // spawned threads while there was no pending async?
-    ev.backing_allocator.free(allocated_ptr[0..idle_stack_end_offset]);
+    const ready_fiber = @atomicLoad(?*Fiber, &ev.thread.ready_queue, .monotonic);
+    assert(ready_fiber == null or ready_fiber == Fiber.finished); // pending async
+    ev.thread.deinit(ev.backing_allocator);
+    ev.backing_allocator.free(ev.allocated_slice);
     ev.* = undefined;
 }
 
 fn findReadyFiber(ev: *Evented, thread: *Thread) ?*Fiber {
+    _ = ev;
     if (@atomicRmw(?*Fiber, &thread.ready_queue, .Xchg, Fiber.finished, .acquire)) |ready_fiber| {
         assert(ready_fiber != Fiber.finished);
         @atomicStore(?*Fiber, &thread.ready_queue, ready_fiber.status.queue_next, .release);
         ready_fiber.status.queue_next = null;
         return ready_fiber;
     }
-    const active_threads = @atomicLoad(u32, &ev.threads.active, .acquire);
-    for (0..@min(max_steal_ready_search, active_threads)) |_| {
-        defer thread.steal_ready_search_index += 1;
-        if (thread.steal_ready_search_index == active_threads) thread.steal_ready_search_index = 0;
-        const steal_ready_search_thread =
-            &ev.threads.allocated[0..active_threads][thread.steal_ready_search_index];
-        if (steal_ready_search_thread == thread) continue;
-        const ready_fiber =
-            @atomicLoad(?*Fiber, &steal_ready_search_thread.ready_queue, .monotonic) orelse continue;
-        if (ready_fiber == Fiber.finished) continue;
-        if (@cmpxchgWeak(
-            ?*Fiber,
-            &steal_ready_search_thread.ready_queue,
-            ready_fiber,
-            null,
-            .acquire,
-            .monotonic,
-        )) |_| continue;
-        @atomicStore(?*Fiber, &thread.ready_queue, ready_fiber.status.queue_next, .release);
-        ready_fiber.status.queue_next = null;
-        return ready_fiber;
-    }
-    // couldn't find anything to do, so we are now open for business
     @atomicStore(?*Fiber, &thread.ready_queue, null, .monotonic);
     return null;
 }
@@ -978,95 +876,8 @@ fn yield(ev: *Evented, maybe_ready_fiber: ?*Fiber, pending_task: SwitchMessage.P
     contextSwitch(&message).handle(ev);
 }
 
-fn schedule(ev: *Evented, thread: *Thread, ready_queue: Fiber.Queue) bool {
-    // shared fields of previous `Thread` must be initialized before later ones are marked as active
-    const new_thread_index = @atomicLoad(u32, &ev.threads.active, .acquire);
-    for (0..@min(max_idle_search, new_thread_index)) |_| {
-        defer thread.idle_search_index += 1;
-        if (thread.idle_search_index == new_thread_index) thread.idle_search_index = 0;
-        const idle_search_thread = &ev.threads.allocated[0..new_thread_index][thread.idle_search_index];
-        if (idle_search_thread == thread) continue;
-        if (@cmpxchgWeak(
-            ?*Fiber,
-            &idle_search_thread.ready_queue,
-            null,
-            ready_queue.head,
-            .release,
-            .monotonic,
-        )) |_| continue;
-        thread.enqueue().* = .{
-            .opcode = .MSG_RING,
-            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-            .ioprio = 0,
-            .fd = idle_search_thread.io_uring.fd,
-            .off = @backingInt(Completion.Userdata.wakeup),
-            .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @backingInt(Completion.Userdata.wakeup),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        return true;
-    }
-    spawn_thread: {
-        // previous failed reservations must have completed before retrying
-        if (new_thread_index == ev.threads.allocated.len or @cmpxchgWeak(
-            u32,
-            &ev.threads.reserved,
-            new_thread_index,
-            new_thread_index + 1,
-            .acquire,
-            .monotonic,
-        ) != null) break :spawn_thread;
-        const new_thread = &ev.threads.allocated[new_thread_index];
-        const next_thread_index = new_thread_index + 1;
-        var params = std.mem.zeroInit(linux.io_uring_params, .{
-            .flags = linux.IORING_SETUP_ATTACH_WQ |
-                linux.IORING_SETUP_R_DISABLED |
-                linux.IORING_SETUP_COOP_TASKRUN |
-                linux.IORING_SETUP_SINGLE_ISSUER,
-            .wq_fd = @as(u32, @intCast(ev.threads.allocated[0].io_uring.fd)),
-        });
-        new_thread.* = .{
-            .required_align = {},
-            .thread = undefined,
-            .idle_context = undefined,
-            .current_context = &new_thread.idle_context,
-            .ready_queue = ready_queue.head,
-            .free_queue = null,
-            .io_uring = IoUring.init_params(@as(u16, 1) << ev.log2_ring_entries, &params) catch |err| {
-                @atomicStore(u32, &ev.threads.reserved, new_thread_index, .release);
-                // no more access to `thread` after giving up reservation
-                log.warn("unable to create worker thread due to io_uring init failure: {s}", .{
-                    @errorName(err),
-                });
-                break :spawn_thread;
-            },
-            .idle_search_index = 0,
-            .steal_ready_search_index = 0,
-            .steal_free_search_index = 0,
-            .name_arena = .{},
-            .csprng = .uninitialized,
-        };
-        new_thread.thread = std.Thread.spawn(.{
-            .stack_size = idle_stack_size,
-            .allocator = ev.allocator(),
-        }, threadEntry, .{ ev, new_thread_index }) catch |err| {
-            new_thread.io_uring.deinit();
-            @atomicStore(u32, &ev.threads.reserved, new_thread_index, .release);
-            // no more access to `thread` after giving up reservation
-            log.warn("unable to create worker thread due spawn failure: {s}", .{@errorName(err)});
-            break :spawn_thread;
-        };
-        // shared fields of `Thread` must be initialized before being marked active
-        @atomicStore(u32, &ev.threads.active, next_thread_index, .release);
-        return false;
-    }
-    // nobody wanted it, so just queue it on ourselves
+fn schedule(ev: *Evented, thread: *Thread, ready_queue: Fiber.Queue) void {
+    _ = ev;
     while (true) ready_queue.tail.status.queue_next = @cmpxchgWeak(
         ?*Fiber,
         &thread.ready_queue,
@@ -1075,16 +886,6 @@ fn schedule(ev: *Evented, thread: *Thread, ready_queue: Fiber.Queue) bool {
         .acq_rel,
         .acquire,
     ) orelse break;
-    return false;
-}
-
-fn threadEntry(ev: *Evented, index: u32) void {
-    const thread: *Thread = &ev.threads.allocated[index];
-    Thread.self = thread;
-    switch (linux.errno(linux.io_uring_register(thread.io_uring.fd, .REGISTER_ENABLE_RINGS, null, 0))) {
-        .SUCCESS => ev.idle(thread),
-        else => |err| @panic(@tagName(err)),
-    }
 }
 
 const Completion = struct {
@@ -1097,7 +898,6 @@ const Completion = struct {
         futex_wake,
         close,
         cleanup,
-        exit,
         /// If bit 0 is 1, a pointer to the `context` field of `Io.Batch.Storage.Pending`.
         /// If bits 0 and 1 are 0, a `*Fiber`.
         _,
@@ -1141,7 +941,7 @@ fn mainIdle(
 ) callconv(.withStackAlign(.c, @max(@alignOf(Thread), @alignOf(Io.fiber.Context)))) noreturn {
     const message: *const SwitchMessage = @fieldParentPtr("contexts", contexts);
     message.handle(ev);
-    ev.idle(&ev.threads.allocated[0]);
+    ev.idle(&ev.thread);
     ev.yield(@ptrCast(&ev.main_fiber_buffer), .nothing);
     unreachable; // switched to dead fiber
 }
@@ -1184,10 +984,6 @@ fn idle(ev: *Evented, thread: *Thread) void {
                     else => {},
                 },
                 .cleanup => @panic("failed to notify other threads that we are exiting"),
-                .exit => {
-                    assert(maybe_ready_fiber == null and maybe_ready_queue == null); // pending async
-                    return;
-                },
                 _ => if (@as(?*Fiber, ready_fiber: switch (@as(u2, @truncate(cqe.user_data))) {
                     0b00 => {
                         const ready_fiber: *Fiber = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
@@ -1263,7 +1059,7 @@ fn idle(ev: *Evented, thread: *Thread) void {
                 },
             };
         }
-        if (maybe_ready_queue) |ready_queue| _ = ev.schedule(thread, ready_queue);
+        if (maybe_ready_queue) |ready_queue| ev.schedule(thread, ready_queue);
     }
 }
 
@@ -1279,40 +1075,33 @@ const SwitchMessage = struct {
         group_cancel: Group,
         batch_await: *Io.Batch,
         destroy,
-        exit,
     };
 
     fn handle(message: *const SwitchMessage, ev: *Evented) void {
         const thread: *Thread = .current();
         thread.current_context = message.contexts.new;
-        if (tracy.enable) {
-            if (message.contexts.new != &thread.idle_context) {
-                const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.new));
-                tracy.fiberEnter(fiber.name);
-            } else tracy.fiberLeave();
-        }
         switch (message.pending_task) {
             .nothing => {},
             .reschedule => if (message.contexts.old != &thread.idle_context) {
                 const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
                 assert(fiber.status.queue_next == null);
-                _ = ev.schedule(thread, .{ .head = fiber, .tail = fiber });
+                ev.schedule(thread, .{ .head = fiber, .tail = fiber });
             },
             .await => |awaiting| {
                 const awaiter: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
                 assert(awaiter.status.queue_next == null);
                 if (@atomicRmw(?*Fiber, &awaiting.link.awaiter, .Xchg, awaiter, .acq_rel) ==
-                    Fiber.finished) _ = ev.schedule(thread, .{ .head = awaiter, .tail = awaiter });
+                    Fiber.finished) ev.schedule(thread, .{ .head = awaiter, .tail = awaiter });
             },
             .group_await => |group| {
                 const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
                 if (group.await(ev, fiber))
-                    _ = ev.schedule(thread, .{ .head = fiber, .tail = fiber });
+                    ev.schedule(thread, .{ .head = fiber, .tail = fiber });
             },
             .group_cancel => |group| {
                 const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
                 if (group.cancel(ev, fiber))
-                    _ = ev.schedule(thread, .{ .head = fiber, .tail = fiber });
+                    ev.schedule(thread, .{ .head = fiber, .tail = fiber });
             },
             .batch_await => |batch| {
                 const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
@@ -1325,32 +1114,12 @@ const SwitchMessage = struct {
                     .monotonic,
                 )) |head| {
                     assert(@as(u2, @truncate(@intFromPtr(head))) != 0b00);
-                    _ = ev.schedule(thread, .{ .head = fiber, .tail = fiber });
+                    ev.schedule(thread, .{ .head = fiber, .tail = fiber });
                 }
             },
             .destroy => {
                 const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
                 fiber.destroy();
-            },
-            .exit => for (
-                ev.threads.allocated[0..@atomicLoad(u32, &ev.threads.active, .acquire)],
-            ) |*each_thread| {
-                thread.enqueue().* = .{
-                    .opcode = .MSG_RING,
-                    .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                    .ioprio = 0,
-                    .fd = each_thread.io_uring.fd,
-                    .off = @backingInt(Completion.Userdata.exit),
-                    .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
-                    .len = 0,
-                    .rw_flags = 0,
-                    .user_data = @backingInt(Completion.Userdata.cleanup),
-                    .buf_index = 0,
-                    .personality = 0,
-                    .splice_fd_in = 0,
-                    .addr3 = 0,
-                    .resv = 0,
-                };
             },
         }
     }
@@ -1487,17 +1256,6 @@ fn concurrent(
         .status = .{ .queue_next = null },
         .cancel_status = .unrequested,
         .cancel_protection = .unblocked,
-        .name = if (tracy.enable) name: {
-            const thread: *Thread = .current();
-            var name_arena = thread.name_arena.promote(std.heap.page_allocator);
-            defer thread.name_arena = name_arena.state;
-            break :name std.fmt.allocPrintSentinel(
-                name_arena.allocator(),
-                "task {d}",
-                .{@atomicRmw(u64, &Fiber.next_name, .Add, 1, .monotonic)},
-                0,
-            ) catch return error.ConcurrencyUnavailable;
-        },
     };
     closure.* = .{
         .evented = ev,
@@ -1508,7 +1266,7 @@ fn concurrent(
     @memcpy(closure.contextPointer(), context);
 
     const thread: *Thread = .current();
-    if (ev.schedule(thread, .{ .head = fiber, .tail = fiber })) thread.submit();
+    ev.schedule(thread, .{ .head = fiber, .tail = fiber });
     return @ptrCast(fiber);
 }
 
@@ -1851,17 +1609,6 @@ fn groupConcurrent(
         .status = .{ .queue_next = null },
         .cancel_status = .unrequested,
         .cancel_protection = .unblocked,
-        .name = if (tracy.enable) name: {
-            const thread: *Thread = .current();
-            var name_arena = thread.name_arena.promote(std.heap.page_allocator);
-            defer thread.name_arena = name_arena.state;
-            break :name std.fmt.allocPrintSentinel(
-                name_arena.allocator(),
-                "group task {d}",
-                .{@atomicRmw(u64, &Fiber.next_name, .Add, 1, .monotonic)},
-                0,
-            ) catch return error.ConcurrencyUnavailable;
-        },
     };
     closure.* = .{
         .evented = ev,
@@ -1872,7 +1619,7 @@ fn groupConcurrent(
     @memcpy(closure.contextPointer(), context);
     group.addFiber(ev, fiber);
     const thread: *Thread = .current();
-    if (ev.schedule(thread, .{ .head = fiber, .tail = fiber })) thread.submit();
+    ev.schedule(thread, .{ .head = fiber, .tail = fiber });
 }
 
 fn groupAwait(
@@ -4927,32 +4674,23 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
 fn random(userdata: ?*anyopaque, buffer: []u8) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var thread: *Thread = .current();
-    if (!thread.csprng.isInitialized()) {
+
+    const ev_io = ev.io();
+    ev.csprng_mutex.lockUncancelable(ev_io);
+    defer ev.csprng_mutex.unlock(ev_io);
+    if (!ev.csprng.isInitialized()) {
         @branchHint(.unlikely);
+        var cancel_region: CancelRegion = .initBlocked();
+        defer cancel_region.deinit();
         var seed: [Csprng.seed_len]u8 = undefined;
-        {
-            const ev_io = ev.io();
-            ev.csprng_mutex.lockUncancelable(ev_io);
-            defer ev.csprng_mutex.unlock(ev_io);
-            if (!ev.csprng.isInitialized()) {
-                @branchHint(.unlikely);
-                var cancel_region: CancelRegion = .initBlocked();
-                defer cancel_region.deinit();
-                ev.urandomReadAll(&cancel_region, &seed) catch |err| switch (err) {
-                    error.Canceled => unreachable, // blocked
-                    else => fallbackSeed(ev, &seed),
-                };
-                ev.csprng.rng = .init(seed);
-                thread = .current();
-            }
-            ev.csprng.rng.fill(&seed);
-        }
-        if (!thread.csprng.isInitialized()) {
-            @branchHint(.likely);
-            thread.csprng.rng = .init(seed);
-        } else thread.csprng.rng.addEntropy(&seed);
+        ev.urandomReadAll(&cancel_region, &seed) catch |err| switch (err) {
+            error.Canceled => unreachable, // blocked
+            else => fallbackSeed(ev, &seed),
+        };
+        ev.csprng.rng = .init(seed);
+        thread = .current();
     }
-    thread.csprng.rng.fill(buffer);
+    ev.csprng.rng.fill(buffer);
 }
 
 fn randomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
