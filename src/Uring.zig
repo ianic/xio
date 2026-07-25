@@ -48,10 +48,8 @@ const winsize = std.posix.winsize;
 /// Empirically saw glibc complain about 256KB.
 const idle_stack_size = 512 * 1024;
 
-backing_allocator_needs_mutex: bool,
-backing_allocator_mutex: Io.Mutex,
-/// Does not need to be thread-safe if not used elsewhere.
 backing_allocator: Allocator,
+allocated_slice: []align(@alignOf(usize)) u8,
 main_fiber_buffer: [
     std.mem.alignForward(usize, @sizeOf(Fiber), @alignOf(Completion)) + @sizeOf(Completion)
 ]u8 align(@max(@alignOf(Fiber), @alignOf(Completion))),
@@ -73,20 +71,15 @@ environ: Environ,
 
 null_fd: CachedFd,
 random_fd: CachedFd,
-
-csprng_mutex: Io.Mutex,
 csprng: Csprng,
-
-// TODO alignment?
-allocated_slice: []align(@alignOf(usize)) u8,
-
-op_getsockname_supported: bool = true,
 
 idle_context: Io.fiber.Context,
 current_context: *Io.fiber.Context,
 ready_queue: ?*Fiber,
 free_queue: ?*Fiber,
 io_uring: IoUring,
+
+op_getsockname_supported: bool = true,
 
 const Fiber = struct {
     required_align: void align(4),
@@ -216,7 +209,7 @@ const Fiber = struct {
             return free_fiber;
         }
         @atomicStore(?*Fiber, &ev.free_queue, null, .monotonic);
-        return @ptrCast(try ev.allocator().alignedAlloc(u8, .of(Fiber), allocation_size));
+        return @ptrCast(try ev.backing_allocator.alignedAlloc(u8, .of(Fiber), allocation_size));
     }
 
     fn destroy(fiber: *Fiber, ev: *Evented) void {
@@ -518,62 +511,6 @@ const CachedFd = struct {
     }
 };
 
-pub fn allocator(ev: *Evented) std.mem.Allocator {
-    return if (ev.backing_allocator_needs_mutex) .{
-        .ptr = ev,
-        .vtable = &.{
-            .alloc = alloc,
-            .resize = resize,
-            .remap = remap,
-            .free = free,
-        },
-    } else ev.backing_allocator;
-}
-
-fn alloc(userdata: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const ev_io = ev.io();
-    ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    defer ev.backing_allocator_mutex.unlock(ev_io);
-    return ev.backing_allocator.rawAlloc(len, alignment, ret_addr);
-}
-
-fn resize(
-    userdata: *anyopaque,
-    memory: []u8,
-    alignment: std.mem.Alignment,
-    new_len: usize,
-    ret_addr: usize,
-) bool {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const ev_io = ev.io();
-    ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    defer ev.backing_allocator_mutex.unlock(ev_io);
-    return ev.backing_allocator.rawResize(memory, alignment, new_len, ret_addr);
-}
-
-fn remap(
-    userdata: *anyopaque,
-    memory: []u8,
-    alignment: Alignment,
-    new_len: usize,
-    ret_addr: usize,
-) ?[*]u8 {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const ev_io = ev.io();
-    ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    defer ev.backing_allocator_mutex.unlock(ev_io);
-    return ev.backing_allocator.rawRemap(memory, alignment, new_len, ret_addr);
-}
-
-fn free(userdata: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const ev_io = ev.io();
-    ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    defer ev.backing_allocator_mutex.unlock(ev_io);
-    return ev.backing_allocator.rawFree(memory, alignment, ret_addr);
-}
-
 pub fn io(ev: *Evented) Io {
     return .{
         .userdata = ev,
@@ -704,8 +641,6 @@ pub fn io(ev: *Evented) Io {
 }
 
 pub const InitOptions = struct {
-    backing_allocator_needs_mutex: bool = false,
-
     /// Maximum thread pool size (excluding the main thread).
     /// Defaults to one less than the number of logical CPU cores.
     thread_limit: ?usize = 0,
@@ -728,8 +663,6 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
     const allocated_slice = try backing_allocator.alignedAlloc(u8, .of(usize), idle_stack_end_offset);
     errdefer backing_allocator.free(allocated_slice);
     ev.* = .{
-        .backing_allocator_needs_mutex = options.backing_allocator_needs_mutex,
-        .backing_allocator_mutex = .init,
         .backing_allocator = backing_allocator,
         .main_fiber_buffer = undefined,
         .sync_limit = if (options.sync_limit.toInt()) |sync_limit| .{ .permits = sync_limit } else null,
@@ -751,7 +684,6 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .null_fd = .init,
         .random_fd = .init,
 
-        .csprng_mutex = .init,
         .csprng = .uninitialized,
         .allocated_slice = allocated_slice,
 
@@ -3937,7 +3869,7 @@ fn processReplace(userdata: ?*anyopaque, options: process.ReplaceOptions) proces
     try ev.scanEnviron(); // for PATH
     const PATH = ev.environ.string.PATH orelse default_PATH;
 
-    var arena_allocator = std.heap.ArenaAllocator.init(ev.allocator());
+    var arena_allocator = std.heap.ArenaAllocator.init(ev.backing_allocator);
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
 
@@ -4071,7 +4003,7 @@ fn spawn(ev: *Evented, options: process.SpawnOptions) process.SpawnError!Spawned
     } else .{ -1, -1 };
     errdefer ev.destroyPipe(prog_pipe);
 
-    var arena_allocator = std.heap.ArenaAllocator.init(ev.allocator());
+    var arena_allocator = std.heap.ArenaAllocator.init(ev.backing_allocator);
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
 
@@ -4546,7 +4478,7 @@ fn scanEnviron(ev: *Evented) Io.Cancelable!void {
     try ev.environ_mutex.lock(ev_io);
     defer ev.environ_mutex.unlock(ev_io);
     if (ev.environ_initialized) return;
-    ev.environ.scan(ev.allocator());
+    ev.environ.scan(ev.backing_allocator);
     ev.environ_initialized = true;
 }
 
@@ -4639,10 +4571,6 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
 
 fn random(userdata: ?*anyopaque, buffer: []u8) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-
-    const ev_io = ev.io();
-    ev.csprng_mutex.lockUncancelable(ev_io);
-    defer ev.csprng_mutex.unlock(ev_io);
     if (!ev.csprng.isInitialized()) {
         @branchHint(.unlikely);
         var cancel_region: CancelRegion = .initBlocked(ev);
