@@ -793,15 +793,15 @@ pub fn io(ev: *Evented) Io {
 }
 
 pub const InitOptions = struct {
-    backing_allocator_needs_mutex: bool = true,
+    backing_allocator_needs_mutex: bool = false,
 
     /// Maximum thread pool size (excluding the main thread).
     /// Defaults to one less than the number of logical CPU cores.
-    thread_limit: ?usize = null,
+    thread_limit: ?usize = 0,
     /// Maximum number of threads that may perform synchronous syscalls.
     sync_limit: Io.Limit = .unlimited,
 
-    log2_ring_entries: u4 = 3,
+    log2_ring_entries: u4 = 10,
 
     /// Affects the following operations:
     /// * `processExecutablePath` on OpenBSD and Haiku.

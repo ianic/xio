@@ -10,11 +10,7 @@ test "tcp echo" {
     const gpa = testing.allocator;
 
     var uring: Uring = undefined;
-    try uring.init(gpa, .{
-        .backing_allocator_needs_mutex = false,
-        .thread_limit = 0,
-        .log2_ring_entries = 10,
-    });
+    try uring.init(gpa, .{});
     defer uring.deinit();
 
     var threaded = Io.Threaded.init(gpa, .{
@@ -154,11 +150,7 @@ test "tcp sendfile" {
     // Init Io.Uring
     const gpa = testing.allocator;
     var uring: Uring = undefined;
-    try uring.init(gpa, .{
-        .backing_allocator_needs_mutex = false,
-        .thread_limit = 0,
-        .log2_ring_entries = 10,
-    });
+    try uring.init(gpa, .{});
     defer uring.deinit();
     const io = uring.io();
 
@@ -237,11 +229,7 @@ test "batch" {
     const io = threaded.io();
 
     // var uring: Io.Uring = undefined;
-    // try uring.init(gpa, .{
-    //     .backing_allocator_needs_mutex = false,
-    //     .thread_limit = 0,
-    //     .log2_ring_entries = 10,
-    // });
+    // try uring.init(gpa, .{});
     // defer uring.deinit();
     // const io = uring.io();
 
