@@ -1741,7 +1741,7 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
             },
         },
         .device_io_control => |o| .{
-            .device_io_control = try ev.deviceIoControl(try maybe_sync.enterSync(ev), o),
+            .device_io_control = try deviceIoControl(try maybe_sync.enterSync(ev), o),
         },
         .net_receive => |o| .{
             .net_receive = r: {
@@ -1828,11 +1828,9 @@ fn fileWriteStreaming(
 }
 
 fn deviceIoControl(
-    ev: *Evented,
     sync: *CancelRegion.Sync,
     o: Io.Operation.DeviceIoControl,
 ) Io.Cancelable!i32 {
-    _ = ev;
     while (true) {
         try sync.cancel_region.await(.nothing);
         const rc = linux.ioctl(o.file.handle, @bitCast(o.code), @intFromPtr(o.arg));
@@ -2043,7 +2041,7 @@ fn batchDrainSubmitted(
             .device_io_control => |o| if (concurrency)
                 return error.ConcurrencyUnavailable
             else
-                .{ .device_io_control = try ev.deviceIoControl(try maybe_sync.enterSync(ev), o) },
+                .{ .device_io_control = try deviceIoControl(try maybe_sync.enterSync(ev), o) },
             .net_receive => |o| {
                 _ = o;
                 @panic("TODO implement batchDrainSubmitted for net_receive");
@@ -2705,7 +2703,7 @@ fn dirRead(userdata: ?*anyopaque, dr: *Dir.Reader, buffer: []Dir.Entry) Dir.Read
             var sync: CancelRegion.Sync = try .init(ev);
             defer sync.deinit(ev);
             if (dr.state == .reset) {
-                ev.lseek(&sync, dr.dir.handle, 0, linux.SEEK.SET) catch |err| switch (err) {
+                lseek(&sync, dr.dir.handle, 0, linux.SEEK.SET) catch |err| switch (err) {
                     error.Unseekable => return error.Unexpected,
                     else => |e| return e,
                 };
@@ -2785,7 +2783,7 @@ fn dirRealPath(userdata: ?*anyopaque, dir: Dir, out_buffer: []u8) Dir.RealPathEr
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
-    return ev.realPath(&sync, dir.handle, out_buffer);
+    return realPath(&sync, dir.handle, out_buffer);
 }
 
 fn dirRealPathFile(
@@ -2811,7 +2809,7 @@ fn dirRealPathFile(
         else => |e| return e,
     };
     defer ev.closeAsync(fd);
-    return ev.realPath(try maybe_sync.enterSync(ev), fd, out_buffer);
+    return realPath(try maybe_sync.enterSync(ev), fd, out_buffer);
 }
 
 fn dirDeleteFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.DeleteFileError!void {
@@ -3075,7 +3073,7 @@ fn dirSetOwner(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
-    try ev.fchownat(
+    try fchownat(
         &sync,
         dir.handle,
         "",
@@ -3098,7 +3096,7 @@ fn dirSetFileOwner(
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
-    try ev.fchownat(
+    try fchownat(
         &sync,
         dir.handle,
         sub_path_posix,
@@ -3116,7 +3114,7 @@ fn dirSetPermissions(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
-    ev.fchmodat(
+    fchmodat(
         &sync,
         dir.handle,
         "",
@@ -3144,7 +3142,7 @@ fn dirSetFilePermissions(
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
-    try ev.fchmodat(
+    try fchmodat(
         &sync,
         dir.handle,
         sub_path_posix,
@@ -3164,7 +3162,7 @@ fn dirSetTimestamps(
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
     var cancel_region: CancelRegion.Sync = try .init(ev);
     defer cancel_region.deinit(ev);
-    try ev.utimensat(
+    try utimensat(
         &cancel_region,
         dir.handle,
         sub_path_posix,
@@ -3376,14 +3374,14 @@ fn fileSeekBy(userdata: ?*anyopaque, file: File, offset: i64) File.SeekError!voi
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
-    try ev.lseek(&sync, file.handle, @bitCast(offset), linux.SEEK.CUR);
+    try lseek(&sync, file.handle, @bitCast(offset), linux.SEEK.CUR);
 }
 
 fn fileSeekTo(userdata: ?*anyopaque, file: File, offset: u64) File.SeekError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
-    try ev.lseek(&sync, file.handle, offset, linux.SEEK.SET);
+    try lseek(&sync, file.handle, offset, linux.SEEK.SET);
 }
 
 fn fileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
@@ -3490,7 +3488,7 @@ fn fileSetOwner(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
-    try ev.fchownat(
+    try fchownat(
         &sync,
         file.handle,
         "",
@@ -3508,7 +3506,7 @@ fn fileSetPermissions(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
-    ev.fchmodat(
+    fchmodat(
         &sync,
         file.handle,
         "",
@@ -3532,7 +3530,7 @@ fn fileSetTimestamps(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
-    try ev.utimensat(
+    try utimensat(
         &sync,
         file.handle,
         "",
@@ -3597,7 +3595,7 @@ fn fileRealPath(userdata: ?*anyopaque, file: File, out_buffer: []u8) File.RealPa
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
-    return ev.realPath(&sync, file.handle, out_buffer);
+    return realPath(&sync, file.handle, out_buffer);
 }
 
 fn fileHardLink(
@@ -5247,14 +5245,12 @@ fn fchdir(sync: *CancelRegion.Sync, dir: fd_t) process.SetCurrentDirError!void {
 }
 
 fn fchmodat(
-    ev: *Evented,
     sync: *CancelRegion.Sync,
     dir: fd_t,
     path: [*:0]const u8,
     mode: linux.mode_t,
     flags: u32,
 ) Dir.SetFilePermissionsError!void {
-    _ = ev;
     while (true) {
         try sync.cancel_region.await(.nothing);
         switch (linux.errno(linux.fchmodat2(dir, path, mode, flags))) {
@@ -5278,7 +5274,6 @@ fn fchmodat(
 }
 
 fn fchownat(
-    ev: *Evented,
     sync: *CancelRegion.Sync,
     dir: fd_t,
     path: [*:0]const u8,
@@ -5286,7 +5281,6 @@ fn fchownat(
     group: linux.gid_t,
     flags: u32,
 ) File.SetOwnerError!void {
-    _ = ev;
     while (true) {
         try sync.cancel_region.await(.nothing);
         switch (linux.errno(linux.fchownat(dir, path, owner, group, flags))) {
@@ -5476,13 +5470,11 @@ fn linkat(
 }
 
 fn lseek(
-    ev: *Evented,
     sync: *CancelRegion.Sync,
     fd: fd_t,
     offset: u64,
     whence: u32,
 ) File.SeekError!void {
-    _ = ev;
     while (true) {
         try sync.cancel_region.await(.nothing);
         var result: u64 = undefined;
@@ -5716,12 +5708,10 @@ fn readAll(
 }
 
 fn realPath(
-    ev: *Evented,
     sync: *CancelRegion.Sync,
     fd: fd_t,
     out_buffer: []u8,
 ) File.RealPathError!usize {
-    _ = ev;
     var procfs_buf: [std.fmt.count("/proc/self/fd/{d}\x00", .{std.math.minInt(fd_t)})]u8 = undefined;
     const proc_path = std.fmt.bufPrintSentinel(&procfs_buf, "/proc/self/fd/{d}", .{fd}, 0) catch
         unreachable;
@@ -5931,14 +5921,12 @@ fn urandomReadAll(
 }
 
 fn utimensat(
-    ev: *Evented,
     sync: *CancelRegion.Sync,
     dir: fd_t,
     path: [*:0]const u8,
     times: ?*const [2]linux.timespec,
     flags: u32,
 ) File.SetTimestampsError!void {
-    _ = ev;
     while (true) {
         try sync.cancel_region.await(.nothing);
         switch (linux.errno(linux.utimensat(dir, path, times, flags))) {
