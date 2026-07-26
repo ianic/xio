@@ -2306,22 +2306,15 @@ fn filePathKind(ev: *Evented, dir: Dir, sub_path: []const u8) !File.Kind {
     while (true) {
         var statx_buf = std.mem.zeroes(linux.Statx);
         try cancel_region.awaitIoUring(ev);
-        ev.enqueue().* = .{
-            .opcode = .STATX,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir.handle,
-            .off = @intFromPtr(&statx_buf),
-            .addr = @intFromPtr(sub_path_posix.ptr),
-            .len = @bitCast(linux.STATX{ .TYPE = true }),
-            .rw_flags = linux.AT.NO_AUTOMOUNT | linux.AT.SYMLINK_NOFOLLOW,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        prepStatx(
+            ev.enqueue(),
+            @intFromPtr(cancel_region.fiber),
+            dir.handle,
+            sub_path_posix.ptr,
+            linux.STATX{ .TYPE = true },
+            &statx_buf,
+            linux.AT.NO_AUTOMOUNT | linux.AT.SYMLINK_NOFOLLOW,
+        );
         ev.yield(null, .nothing);
         switch (cancel_region.errno()) {
             .SUCCESS => {
@@ -3226,22 +3219,15 @@ fn fileLength(userdata: ?*anyopaque, file: File) File.LengthError!u64 {
     while (true) {
         var statx_buf = std.mem.zeroes(linux.Statx);
         try cancel_region.awaitIoUring(ev);
-        ev.enqueue().* = .{
-            .opcode = .STATX,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = file.handle,
-            .off = @intFromPtr(&statx_buf),
-            .addr = @intFromPtr(""),
-            .len = @bitCast(linux.STATX{ .SIZE = true }),
-            .rw_flags = linux.AT.EMPTY_PATH,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        prepStatx(
+            ev.enqueue(),
+            @intFromPtr(cancel_region.fiber),
+            file.handle,
+            "",
+            linux.STATX{ .SIZE = true },
+            &statx_buf,
+            linux.AT.EMPTY_PATH,
+        );
         ev.yield(null, .nothing);
         switch (cancel_region.errno()) {
             .SUCCESS => {
@@ -5840,36 +5826,17 @@ fn setsockopt(
     opt_name: u32,
     option: u32,
 ) !void {
-    const o: []const u8 = @ptrCast(&option);
     while (true) {
-        const off: extern struct {
-            cmd_op: linux.IO_URING_SOCKET_OP,
-            pad: u32,
-        } align(@alignOf(u64)) = .{
-            .cmd_op = .SETSOCKOPT,
-            .pad = 0,
-        };
-        const addr: extern struct { level: i32, opt_name: u32 } align(@alignOf(u64)) = .{
-            .level = level,
-            .opt_name = opt_name,
-        };
         try cancel_region.awaitIoUring(ev);
-        ev.enqueue().* = .{
-            .opcode = .URING_CMD,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = fd,
-            .off = @as(*const u64, @ptrCast(&off)).*,
-            .addr = @as(*const u64, @ptrCast(&addr)).*,
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = @intCast(o.len),
-            .addr3 = @intFromPtr(o.ptr),
-            .resv = 0,
-        };
+        prepSetsockopt(
+            ev.enqueue(),
+            @intFromPtr(cancel_region.fiber),
+            fd,
+            level,
+            opt_name,
+            @intFromPtr(&option),
+            @sizeOf(u32),
+        );
         ev.yield(null, .nothing);
         switch (cancel_region.errno()) {
             .SUCCESS => return,
@@ -5903,22 +5870,14 @@ fn socket(
     const mode, const protocol = try posixSocketModeProtocol(family, options.mode, options.protocol);
     const socket_fd = while (true) {
         try cancel_region.awaitIoUring(ev);
-        ev.enqueue().* = .{
-            .opcode = .SOCKET,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = family,
-            .off = mode | linux.SOCK.CLOEXEC,
-            .addr = 0,
-            .len = protocol,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        prepSocket(
+            ev.enqueue(),
+            @intFromPtr(cancel_region.fiber),
+            family,
+            mode | linux.SOCK.CLOEXEC,
+            protocol,
+            0,
+        );
         ev.yield(null, .nothing);
         const completion = cancel_region.completion();
         switch (completion.errno()) {
@@ -5966,22 +5925,7 @@ fn statx(
     while (true) {
         var statx_buf = std.mem.zeroes(linux.Statx);
         try cancel_region.awaitIoUring(ev);
-        ev.enqueue().* = .{
-            .opcode = .STATX,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir,
-            .off = @intFromPtr(&statx_buf),
-            .addr = @intFromPtr(path),
-            .len = @bitCast(linux_statx_request),
-            .rw_flags = flags,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        prepStatx(ev.enqueue(), @intFromPtr(cancel_region.fiber), dir, path, linux_statx_request, &statx_buf, flags);
         ev.yield(null, .nothing);
         switch (cancel_region.errno()) {
             .SUCCESS => return statFromLinux(&statx_buf),
@@ -6044,22 +5988,7 @@ fn listen(
 ) !void {
     while (true) {
         try cancel_region.awaitIoUring(ev);
-        ev.enqueue().* = .{
-            .opcode = .LISTEN,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = socket_fd,
-            .off = 0,
-            .addr = 0,
-            .len = backlog,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        prepListen(ev.enqueue(), @intFromPtr(cancel_region.fiber), socket_fd, backlog, 0);
         ev.yield(null, .nothing);
         switch (cancel_region.errno()) {
             .SUCCESS => return,
@@ -6113,22 +6042,13 @@ fn send(
 ) net.Stream.Writer.Error!usize {
     while (true) {
         try cancel_region.awaitIoUring(ev);
-        ev.enqueue().* = .{
-            .opcode = .SEND,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = socket_fd,
-            .off = 0,
-            .addr = @intFromPtr(buffer.ptr),
-            .len = @intCast(buffer.len),
-            .rw_flags = flags,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        prepSend(
+            ev.enqueue(),
+            @intFromPtr(cancel_region.fiber),
+            socket_fd,
+            buffer,
+            flags,
+        );
         ev.yield(null, .nothing);
         const completion = cancel_region.completion();
         switch (completion.errno()) {
@@ -6149,22 +6069,13 @@ fn sendmsg(
 ) ErrorSet!usize {
     while (true) {
         try cancel_region.awaitIoUring(ev);
-        ev.enqueue().* = .{
-            .opcode = .SENDMSG,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = socket_fd,
-            .off = 0,
-            .addr = @intFromPtr(msg),
-            .len = 1,
-            .rw_flags = flags,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        prepSendmsg(
+            ev.enqueue(),
+            @intFromPtr(cancel_region.fiber),
+            socket_fd,
+            msg,
+            flags,
+        );
         ev.yield(null, .nothing);
         const completion = cancel_region.completion();
         switch (completion.errno()) {
@@ -6231,23 +6142,12 @@ fn pipe2(ev: *Evented, cancel_region: *CancelRegion, flags: linux.O) PipeAsyncEr
     var fds: [2]fd_t = undefined;
     while (true) {
         try cancel_region.awaitIoUring(ev);
-        const OP_PIPE = 62;
-        ev.enqueue().* = .{
-            .opcode = @fromBackingInt(@intCast(OP_PIPE)),
-            .flags = 0,
-            .ioprio = 0,
-            .fd = 0,
-            .off = 0,
-            .addr = @intFromPtr(&fds),
-            .len = 0,
-            .rw_flags = @bitCast(flags),
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        prepPipe(
+            ev.enqueue(),
+            @intFromPtr(cancel_region.fiber),
+            &fds,
+            @bitCast(flags),
+        );
         ev.yield(null, .nothing);
         const completion = cancel_region.completion();
         switch (completion.errno()) {
@@ -6307,10 +6207,16 @@ fn splice(
     const splice_f_nonblock = 0x02;
     while (true) {
         try cancel_region.awaitIoUring(ev);
-        var sqe = ev.enqueue();
-        sqe.prep_splice(fd_in, off_in, fd_out, off_out, len);
-        sqe.user_data = @intFromPtr(cancel_region.fiber);
-        sqe.rw_flags |= splice_f_nonblock;
+        prepSplice(
+            ev.enqueue(),
+            @intFromPtr(cancel_region.fiber),
+            fd_in,
+            off_in,
+            fd_out,
+            off_out,
+            len,
+            splice_f_nonblock,
+        );
         ev.yield(null, .nothing);
         const completion = cancel_region.completion();
         switch (completion.errno()) {
@@ -6360,3 +6266,125 @@ const linuxx = struct {
         GETSOCKNAME = 5,
     };
 };
+
+fn prepSplice(
+    sqe: *linux.io_uring_sqe,
+    user_data: u64,
+    fd_in: linux.fd_t,
+    off_in: u64,
+    fd_out: linux.fd_t,
+    off_out: u64,
+    len: usize,
+    flags: u32,
+) void {
+    sqe.prep_rw(.SPLICE, fd_out, off_in, len, off_out);
+    sqe.splice_fd_in = fd_in;
+    sqe.user_data = user_data;
+    sqe.rw_flags = flags;
+}
+
+fn prepPipe(
+    sqe: *linux.io_uring_sqe,
+    user_data: u64,
+    fds: *[2]linux.fd_t,
+    flags: u32,
+) void {
+    const OP_PIPE = 62;
+    sqe.prep_rw(@fromBackingInt(@intCast(OP_PIPE)), 0, @intFromPtr(fds), 0, 0);
+    sqe.user_data = user_data;
+    sqe.rw_flags = flags;
+}
+
+fn prepListen(
+    sqe: *linux.io_uring_sqe,
+    user_data: u64,
+    fd: linux.fd_t,
+    backlog: usize,
+    flags: u32,
+) void {
+    sqe.prep_rw(.LISTEN, fd, 0, backlog, 0);
+    sqe.user_data = user_data;
+    sqe.rw_flags = flags;
+}
+
+fn prepStatx(
+    sqe: *linux.io_uring_sqe,
+    user_data: u64,
+    fd: linux.fd_t,
+    path: [*:0]const u8,
+    mask: linux.STATX,
+    buf: *linux.Statx,
+    flags: u32,
+) void {
+    sqe.prep_rw(.STATX, fd, @intFromPtr(path), @as(u32, @bitCast(mask)), @intFromPtr(buf));
+    sqe.user_data = user_data;
+    sqe.rw_flags = flags;
+}
+
+fn prepSendmsg(
+    sqe: *linux.io_uring_sqe,
+    user_data: u64,
+    fd: linux.fd_t,
+    msg: *const linux.msghdr_const,
+    flags: u32,
+) void {
+    sqe.prep_rw(.SENDMSG, fd, @intFromPtr(msg), 1, 0);
+    sqe.user_data = user_data;
+    sqe.rw_flags = flags;
+}
+
+fn prepSend(
+    sqe: *linux.io_uring_sqe,
+    user_data: u64,
+    fd: linux.fd_t,
+    buffer: []const u8,
+    flags: u32,
+) void {
+    sqe.prep_rw(.SEND, fd, @intFromPtr(buffer.ptr), buffer.len, 0);
+    sqe.user_data = user_data;
+    sqe.rw_flags = flags;
+}
+
+pub fn prepSocket(
+    sqe: *linux.io_uring_sqe,
+    user_data: u64,
+    domain: u32,
+    socket_type: u32,
+    protocol: u32,
+    flags: u32,
+) void {
+    sqe.prep_rw(.SOCKET, @intCast(domain), 0, protocol, socket_type);
+    sqe.user_data = user_data;
+    sqe.rw_flags = flags;
+}
+
+pub fn prepSetsockopt(
+    sqe: *linux.io_uring_sqe,
+    user_data: u64,
+    fd: fd_t,
+    level: i32,
+    opt_name: u32,
+    optval: u64,
+    optlen: u32,
+) void {
+    sqe.prep_rw(.URING_CMD, fd, 0, 0, 0);
+    sqe.user_data = user_data;
+
+    const off: extern struct {
+        cmd_op: linux.IO_URING_SOCKET_OP,
+        pad: u32,
+    } align(@alignOf(u64)) = .{
+        .cmd_op = .SETSOCKOPT,
+        .pad = 0,
+    };
+    const addr: extern struct { level: i32, opt_name: u32 } align(@alignOf(u64)) = .{
+        .level = level,
+        .opt_name = opt_name,
+    };
+    sqe.off = @as(*const u64, @ptrCast(&off)).*;
+    sqe.addr = @as(*const u64, @ptrCast(&addr)).*;
+    sqe.splice_fd_in = @intCast(optlen);
+    sqe.addr3 = optval;
+}
+
+// prep_rw: opcode, fd, addr, len, off
