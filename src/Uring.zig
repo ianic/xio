@@ -17,7 +17,7 @@ const fallbackSeed = Io.Threaded.fallbackSeed;
 const fd_t = linux.fd_t;
 const File = Io.File;
 const Io = std.Io;
-const IoUring = linux.IoUring;
+const IoUring = @import("linux/IoUring.zig");
 const iovec = std.posix.iovec;
 const iovec_const = std.posix.iovec_const;
 const linux = std.os.linux;
@@ -745,7 +745,7 @@ fn currentFiber(ev: *Evented) *Fiber {
     return @fieldParentPtr("context", ev.current_context);
 }
 
-fn enqueue(ev: *Evented) *linux.io_uring_sqe {
+fn enqueue(ev: *Evented) *IoUring.io_uring_sqe {
     while (true) return ev.io_uring.get_sqe() catch {
         ev.submit();
         continue;
@@ -6268,7 +6268,7 @@ const linuxx = struct {
 };
 
 fn prepSplice(
-    sqe: *linux.io_uring_sqe,
+    sqe: *IoUring.io_uring_sqe,
     user_data: u64,
     fd_in: linux.fd_t,
     off_in: u64,
@@ -6284,7 +6284,7 @@ fn prepSplice(
 }
 
 fn prepPipe(
-    sqe: *linux.io_uring_sqe,
+    sqe: *IoUring.io_uring_sqe,
     user_data: u64,
     fds: *[2]linux.fd_t,
     flags: u32,
@@ -6296,7 +6296,7 @@ fn prepPipe(
 }
 
 fn prepListen(
-    sqe: *linux.io_uring_sqe,
+    sqe: *IoUring.io_uring_sqe,
     user_data: u64,
     fd: linux.fd_t,
     backlog: usize,
@@ -6308,7 +6308,7 @@ fn prepListen(
 }
 
 fn prepStatx(
-    sqe: *linux.io_uring_sqe,
+    sqe: *IoUring.io_uring_sqe,
     user_data: u64,
     fd: linux.fd_t,
     path: [*:0]const u8,
@@ -6322,7 +6322,7 @@ fn prepStatx(
 }
 
 fn prepSendmsg(
-    sqe: *linux.io_uring_sqe,
+    sqe: *IoUring.io_uring_sqe,
     user_data: u64,
     fd: linux.fd_t,
     msg: *const linux.msghdr_const,
@@ -6334,7 +6334,7 @@ fn prepSendmsg(
 }
 
 fn prepSend(
-    sqe: *linux.io_uring_sqe,
+    sqe: *IoUring.io_uring_sqe,
     user_data: u64,
     fd: linux.fd_t,
     buffer: []const u8,
@@ -6346,7 +6346,7 @@ fn prepSend(
 }
 
 pub fn prepSocket(
-    sqe: *linux.io_uring_sqe,
+    sqe: *IoUring.io_uring_sqe,
     user_data: u64,
     domain: u32,
     socket_type: u32,
@@ -6359,7 +6359,7 @@ pub fn prepSocket(
 }
 
 pub fn prepSetsockopt(
-    sqe: *linux.io_uring_sqe,
+    sqe: *IoUring.io_uring_sqe,
     user_data: u64,
     fd: fd_t,
     level: i32,

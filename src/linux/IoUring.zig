@@ -3,7 +3,7 @@ const IoUring = @This();
 const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
 
-const std = @import("../../std.zig");
+const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
@@ -11,6 +11,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const testing = std.testing;
 const page_size_min = std.heap.page_size_min;
+pub const io_uring_sqe = @import("io_uring_sqe.zig").io_uring_sqe;
 
 fd: linux.fd_t = -1,
 sq: SubmissionQueue,
@@ -149,7 +150,7 @@ pub fn deinit(self: *IoUring) void {
 /// and the null return in liburing is more a C idiom than anything else, for lack of a better
 /// alternative. In Zig, we have first-class error handling... so let's use it.
 /// Matches the implementation of io_uring_get_sqe() in liburing.
-pub fn get_sqe(self: *IoUring) !*linux.io_uring_sqe {
+pub fn get_sqe(self: *IoUring) !*io_uring_sqe {
     const head = @atomicLoad(u32, self.sq.head, .acquire);
     // Remember that these head and tail offsets wrap around every four billion operations.
     // We must therefore use wrapping addition and subtraction to avoid a runtime crash.
@@ -226,10 +227,10 @@ pub fn submit_and_wait_min_timeout(
 
         if (self.features & linux.IORING_FEAT_EXT_ARG == 0)
             return error.SystemOutdated;
-        if (min_wait_usec > 0 and (self.features & linux.IORING_FEAT_MIN_TIMEOUT == 0))
+        if (min_wait_usec > 0 and (self.features & linuxx.IORING_FEAT_MIN_TIMEOUT == 0))
             return error.SystemOutdated;
 
-        const arg = std.mem.zeroInit(linux.io_uring_getevents_arg, .{
+        const arg = std.mem.zeroInit(linuxx.io_uring_getevents_arg, .{
             .sigmask_sz = linux.NSIG / 8,
             .ts = @intFromPtr(wait_timeout),
             .min_wait_usec = min_wait_usec,
@@ -246,16 +247,16 @@ pub fn enter(
     to_submit: u32,
     min_complete: u32,
     flags: u32,
-    arg: ?*const linux.io_uring_getevents_arg,
+    arg: ?*const linuxx.io_uring_getevents_arg,
 ) !u32 {
     assert(self.fd >= 0);
-    const res = linux.io_uring_enter(
+    const res = linuxx.io_uring_enter(
         self.fd,
         to_submit,
         min_complete,
         if (arg != null) flags | linux.IORING_ENTER_EXT_ARG else flags,
         arg,
-        if (arg != null) @sizeOf(linux.io_uring_getevents_arg) else linux.NSIG / 8,
+        if (arg != null) @sizeOf(linuxx.io_uring_getevents_arg) else linux.NSIG / 8,
     );
     switch (linux.errno(res)) {
         .SUCCESS => {},
@@ -439,7 +440,7 @@ pub fn set_iowait(self: *IoUring, enable: bool) !void {
 /// apply to the write, since the fsync may complete before the write is issued to the disk.
 /// You should preferably use `link_with_next_sqe()` on a write's SQE to link it with an fsync,
 /// or else insert a full write barrier using `drain_previous_sqes()` when queueing an fsync.
-pub fn fsync(self: *IoUring, user_data: u64, fd: linux.fd_t, flags: u32) !*linux.io_uring_sqe {
+pub fn fsync(self: *IoUring, user_data: u64, fd: linux.fd_t, flags: u32) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_fsync(fd, flags);
     sqe.user_data = user_data;
@@ -451,7 +452,7 @@ pub fn fsync(self: *IoUring, user_data: u64, fd: linux.fd_t, flags: u32) !*linux
 /// A no-op is more useful than may appear at first glance.
 /// For example, you could call `drain_previous_sqes()` on the returned SQE, to use the no-op to
 /// know when the ring is idle before acting on a kill signal.
-pub fn nop(self: *IoUring, user_data: u64) !*linux.io_uring_sqe {
+pub fn nop(self: *IoUring, user_data: u64) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_nop();
     sqe.user_data = user_data;
@@ -487,7 +488,7 @@ pub fn read(
     fd: linux.fd_t,
     buffer: ReadBuffer,
     offset: u64,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     switch (buffer) {
         .buffer => |slice| sqe.prep_read(fd, slice, offset),
@@ -510,7 +511,7 @@ pub fn write(
     fd: linux.fd_t,
     buffer: []const u8,
     offset: u64,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_write(fd, buffer, offset);
     sqe.user_data = user_data;
@@ -531,7 +532,7 @@ pub fn write(
 /// See https://github.com/axboe/liburing/issues/291
 ///
 /// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
-pub fn splice(self: *IoUring, user_data: u64, fd_in: linux.fd_t, off_in: u64, fd_out: linux.fd_t, off_out: u64, len: usize) !*linux.io_uring_sqe {
+pub fn splice(self: *IoUring, user_data: u64, fd_in: linux.fd_t, off_in: u64, fd_out: linux.fd_t, off_out: u64, len: usize) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_splice(fd_in, off_in, fd_out, off_out, len);
     sqe.user_data = user_data;
@@ -550,7 +551,7 @@ pub fn read_fixed(
     buffer: *posix.iovec,
     offset: u64,
     buffer_index: u16,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_read_fixed(fd, buffer, offset, buffer_index);
     sqe.user_data = user_data;
@@ -567,7 +568,7 @@ pub fn writev(
     fd: linux.fd_t,
     iovecs: []const posix.iovec_const,
     offset: u64,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_writev(fd, iovecs, offset);
     sqe.user_data = user_data;
@@ -586,7 +587,7 @@ pub fn write_fixed(
     buffer: *posix.iovec,
     offset: u64,
     buffer_index: u16,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_write_fixed(fd, buffer, offset, buffer_index);
     sqe.user_data = user_data;
@@ -603,7 +604,7 @@ pub fn accept(
     addr: ?*posix.sockaddr,
     addrlen: ?*posix.socklen_t,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_accept(fd, addr, addrlen, flags);
     sqe.user_data = user_data;
@@ -625,7 +626,7 @@ pub fn accept_multishot(
     addr: ?*posix.sockaddr,
     addrlen: ?*posix.socklen_t,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_multishot_accept(fd, addr, addrlen, flags);
     sqe.user_data = user_data;
@@ -650,7 +651,7 @@ pub fn accept_direct(
     addr: ?*posix.sockaddr,
     addrlen: ?*posix.socklen_t,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_accept_direct(fd, addr, addrlen, flags, linux.IORING_FILE_INDEX_ALLOC);
     sqe.user_data = user_data;
@@ -666,7 +667,7 @@ pub fn accept_multishot_direct(
     addr: ?*posix.sockaddr,
     addrlen: ?*posix.socklen_t,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_multishot_accept_direct(fd, addr, addrlen, flags);
     sqe.user_data = user_data;
@@ -681,7 +682,7 @@ pub fn connect(
     fd: linux.fd_t,
     addr: *const posix.sockaddr,
     addrlen: posix.socklen_t,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_connect(fd, addr, addrlen);
     sqe.user_data = user_data;
@@ -697,7 +698,7 @@ pub fn epoll_ctl(
     fd: linux.fd_t,
     op: u32,
     ev: ?*linux.epoll_event,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_epoll_ctl(epfd, fd, op, ev);
     sqe.user_data = user_data;
@@ -727,7 +728,7 @@ pub fn recv(
     fd: linux.fd_t,
     buffer: RecvBuffer,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     switch (buffer) {
         .buffer => |slice| sqe.prep_recv(fd, slice, flags),
@@ -751,7 +752,7 @@ pub fn send(
     fd: linux.fd_t,
     buffer: []const u8,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_send(fd, buffer, flags);
     sqe.user_data = user_data;
@@ -780,7 +781,7 @@ pub fn send_zc(
     buffer: []const u8,
     send_flags: u32,
     zc_flags: u16,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_send_zc(fd, buffer, send_flags, zc_flags);
     sqe.user_data = user_data;
@@ -798,7 +799,7 @@ pub fn send_zc_fixed(
     send_flags: u32,
     zc_flags: u16,
     buf_index: u16,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_send_zc_fixed(fd, buffer, send_flags, zc_flags, buf_index);
     sqe.user_data = user_data;
@@ -814,7 +815,7 @@ pub fn recvmsg(
     fd: linux.fd_t,
     msg: *linux.msghdr,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_recvmsg(fd, msg, flags);
     sqe.user_data = user_data;
@@ -830,7 +831,7 @@ pub fn sendmsg(
     fd: linux.fd_t,
     msg: *const linux.msghdr_const,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_sendmsg(fd, msg, flags);
     sqe.user_data = user_data;
@@ -846,7 +847,7 @@ pub fn sendmsg_zc(
     fd: linux.fd_t,
     msg: *const linux.msghdr_const,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_sendmsg_zc(fd, msg, flags);
     sqe.user_data = user_data;
@@ -863,7 +864,7 @@ pub fn openat(
     path: [*:0]const u8,
     flags: linux.O,
     mode: posix.mode_t,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_openat(fd, path, flags, mode);
     sqe.user_data = user_data;
@@ -889,7 +890,7 @@ pub fn openat_direct(
     flags: linux.O,
     mode: posix.mode_t,
     file_index: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_openat_direct(fd, path, flags, mode, file_index);
     sqe.user_data = user_data;
@@ -899,7 +900,7 @@ pub fn openat_direct(
 /// Queues (but does not submit) an SQE to perform a `close(2)`.
 /// Returns a pointer to the SQE.
 /// Available since 5.6.
-pub fn close(self: *IoUring, user_data: u64, fd: linux.fd_t) !*linux.io_uring_sqe {
+pub fn close(self: *IoUring, user_data: u64, fd: linux.fd_t) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_close(fd);
     sqe.user_data = user_data;
@@ -908,7 +909,7 @@ pub fn close(self: *IoUring, user_data: u64, fd: linux.fd_t) !*linux.io_uring_sq
 
 /// Queues close of registered file descriptor.
 /// Available since 5.15
-pub fn close_direct(self: *IoUring, user_data: u64, file_index: u32) !*linux.io_uring_sqe {
+pub fn close_direct(self: *IoUring, user_data: u64, file_index: u32) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_close_direct(file_index);
     sqe.user_data = user_data;
@@ -934,7 +935,7 @@ pub fn timeout(
     ts: *const linux.kernel_timespec,
     count: u32,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_timeout(ts, count, flags);
     sqe.user_data = user_data;
@@ -954,7 +955,7 @@ pub fn timeout_remove(
     user_data: u64,
     timeout_user_data: u64,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_timeout_remove(timeout_user_data, flags);
     sqe.user_data = user_data;
@@ -982,7 +983,7 @@ pub fn link_timeout(
     user_data: u64,
     ts: *const linux.kernel_timespec,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_link_timeout(ts, flags);
     sqe.user_data = user_data;
@@ -996,7 +997,7 @@ pub fn poll_add(
     user_data: u64,
     fd: linux.fd_t,
     poll_mask: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_poll_add(fd, poll_mask);
     sqe.user_data = user_data;
@@ -1009,7 +1010,7 @@ pub fn poll_remove(
     self: *IoUring,
     user_data: u64,
     target_user_data: u64,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_poll_remove(target_user_data);
     sqe.user_data = user_data;
@@ -1025,7 +1026,7 @@ pub fn poll_update(
     new_user_data: u64,
     poll_mask: u32,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_poll_update(old_user_data, new_user_data, poll_mask, flags);
     sqe.user_data = user_data;
@@ -1041,7 +1042,7 @@ pub fn fallocate(
     mode: i32,
     offset: u64,
     len: u64,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_fallocate(fd, mode, offset, len);
     sqe.user_data = user_data;
@@ -1058,7 +1059,7 @@ pub fn statx(
     flags: u32,
     mask: linux.STATX,
     buf: *linux.Statx,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_statx(fd, path, flags, mask, buf);
     sqe.user_data = user_data;
@@ -1078,7 +1079,7 @@ pub fn cancel(
     user_data: u64,
     cancel_user_data: u64,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_cancel(cancel_user_data, flags);
     sqe.user_data = user_data;
@@ -1094,7 +1095,7 @@ pub fn shutdown(
     user_data: u64,
     sockfd: posix.socket_t,
     how: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_shutdown(sockfd, how);
     sqe.user_data = user_data;
@@ -1111,7 +1112,7 @@ pub fn renameat(
     new_dir_fd: linux.fd_t,
     new_path: [*:0]const u8,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_renameat(old_dir_fd, old_path, new_dir_fd, new_path, flags);
     sqe.user_data = user_data;
@@ -1126,7 +1127,7 @@ pub fn unlinkat(
     dir_fd: linux.fd_t,
     path: [*:0]const u8,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_unlinkat(dir_fd, path, flags);
     sqe.user_data = user_data;
@@ -1141,7 +1142,7 @@ pub fn mkdirat(
     dir_fd: linux.fd_t,
     path: [*:0]const u8,
     mode: posix.mode_t,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_mkdirat(dir_fd, path, mode);
     sqe.user_data = user_data;
@@ -1156,7 +1157,7 @@ pub fn symlinkat(
     target: [*:0]const u8,
     new_dir_fd: linux.fd_t,
     link_path: [*:0]const u8,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_symlinkat(target, new_dir_fd, link_path);
     sqe.user_data = user_data;
@@ -1173,7 +1174,7 @@ pub fn linkat(
     new_dir_fd: linux.fd_t,
     new_path: [*:0]const u8,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_linkat(old_dir_fd, old_path, new_dir_fd, new_path, flags);
     sqe.user_data = user_data;
@@ -1194,7 +1195,7 @@ pub fn provide_buffers(
     buffers_count: usize,
     group_id: usize,
     buffer_id: usize,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_provide_buffers(buffers, buffer_size, buffers_count, group_id, buffer_id);
     sqe.user_data = user_data;
@@ -1208,7 +1209,7 @@ pub fn remove_buffers(
     user_data: u64,
     buffers_count: usize,
     group_id: usize,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_remove_buffers(buffers_count, group_id);
     sqe.user_data = user_data;
@@ -1225,7 +1226,7 @@ pub fn waitid(
     infop: *linux.siginfo_t,
     options: u32,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_waitid(id_type, id, infop, options, flags);
     sqe.user_data = user_data;
@@ -1239,7 +1240,7 @@ pub fn pipe(
     user_data: u64,
     fds: *[2]linux.fd_t,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_pipe(fds, flags);
     sqe.user_data = user_data;
@@ -1253,7 +1254,7 @@ pub fn pipe_direct(
     user_data: u64,
     fds: *[2]linux.fd_t,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.pipe(user_data, fds, flags);
     sqe.splice_fd_in = @bitCast(@as(u32, linux.IORING_FILE_INDEX_ALLOC));
     return sqe;
@@ -1483,7 +1484,7 @@ pub fn socket(
     socket_type: u32,
     protocol: u32,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_socket(domain, socket_type, protocol, flags);
     sqe.user_data = user_data;
@@ -1500,7 +1501,7 @@ pub fn socket_direct(
     protocol: u32,
     flags: u32,
     file_index: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_socket_direct(domain, socket_type, protocol, flags, file_index);
     sqe.user_data = user_data;
@@ -1517,7 +1518,7 @@ pub fn socket_direct_alloc(
     socket_type: u32,
     protocol: u32,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_socket_direct_alloc(domain, socket_type, protocol, flags);
     sqe.user_data = user_data;
@@ -1534,7 +1535,7 @@ pub fn bind(
     addr: *const posix.sockaddr,
     addrlen: posix.socklen_t,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_bind(fd, addr, addrlen, flags);
     sqe.user_data = user_data;
@@ -1550,7 +1551,7 @@ pub fn listen(
     fd: linux.fd_t,
     backlog: usize,
     flags: u32,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_listen(fd, backlog, flags);
     sqe.user_data = user_data;
@@ -1569,7 +1570,7 @@ pub fn cmd_sock(
     optname: u32, // linux.SO
     optval: u64, // pointer to the option value
     optlen: u32, // size of the option value
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     const sqe = try self.get_sqe();
     sqe.prep_cmd_sock(cmd_op, fd, level, optname, optval, optlen);
     sqe.user_data = user_data;
@@ -1586,7 +1587,7 @@ pub fn setsockopt(
     level: u32, // linux.SOL
     optname: u32, // linux.SO
     opt: []const u8,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     return try self.cmd_sock(
         user_data,
         .SETSOCKOPT,
@@ -1608,7 +1609,7 @@ pub fn getsockopt(
     level: u32, // linux.SOL
     optname: u32, // linux.SO
     opt: []u8,
-) !*linux.io_uring_sqe {
+) !*io_uring_sqe {
     return try self.cmd_sock(
         user_data,
         .GETSOCKOPT,
@@ -1688,7 +1689,7 @@ pub const SubmissionQueue = struct {
     flags: *u32,
     dropped: *u32,
     array: []u32,
-    sqes: []linux.io_uring_sqe,
+    sqes: []io_uring_sqe,
     mmap: []align(page_size_min) u8,
     mmap_sqes: []align(page_size_min) u8,
 
@@ -1718,8 +1719,8 @@ pub const SubmissionQueue = struct {
         assert(mmap.len == size);
 
         // The motivation for the `sqes` and `array` indirection is to make it possible for the
-        // application to preallocate static linux.io_uring_sqe entries and then replay them when needed.
-        const size_sqes = p.sq_entries * @sizeOf(linux.io_uring_sqe);
+        // application to preallocate static io_uring_sqe entries and then replay them when needed.
+        const size_sqes = p.sq_entries * @sizeOf(io_uring_sqe);
         const mmap_sqes = try posix.mmap(
             null,
             size_sqes,
@@ -1740,7 +1741,7 @@ pub const SubmissionQueue = struct {
             array[i] = @intCast(i);
         }
 
-        const sqes: [*]linux.io_uring_sqe = @ptrCast(@alignCast(&mmap_sqes[0]));
+        const sqes: [*]io_uring_sqe = @ptrCast(@alignCast(&mmap_sqes[0]));
         // We expect the kernel copies p.sq_entries to the u32 pointed to by p.sq_off.ring_entries,
         // see https://github.com/torvalds/linux/blob/v5.8/fs/io_uring.c#L7843-L7844.
         assert(p.sq_entries == @as(*u32, @ptrCast(@alignCast(&mmap[p.sq_off.ring_entries]))).*);
@@ -1789,198 +1790,6 @@ pub const CompletionQueue = struct {
         _ = self;
         // A no-op since we now share the mmap with the submission queue.
         // Here for symmetry with the submission queue, and for any future feature support.
-    }
-};
-
-/// Group of application provided buffers. Uses newer type, called ring mapped
-/// buffers, supported since kernel 5.19. Buffers are identified by a buffer
-/// group ID, and within that group, a buffer ID. IOUring can have multiple
-/// buffer groups, each with unique group ID.
-///
-/// In `init` application provides contiguous block of memory `buffers` for
-/// `buffers_count` buffers of size `buffers_size`. Application can then submit
-/// `recv` operation without providing buffer upfront. Once the operation is
-/// ready to receive data, a buffer is picked automatically and the resulting
-/// CQE will contain the buffer ID in `cqe.buffer_id()`. Use `get` method to get
-/// buffer for buffer ID identified by CQE. Once the application has processed
-/// the buffer, it should hand ownership back to the kernel, by calling `put`
-/// allowing the cycle to repeat.
-///
-/// When using bundle receive application must return buffers to the kernel in
-/// order; following each get with put for the same cqe. Spanning multiple
-/// buffers in bundle receive assumes static slots of buffer ids.
-///
-/// Depending on the rate of arrival of data, it is possible that a given buffer
-/// group will run out of buffers before those in CQEs can be put back to the
-/// kernel. If this happens, a `cqe.err()` will have ENOBUFS as the error value.
-///
-pub const BufferGroup = struct {
-    /// Parent ring for which this group is registered.
-    ring: *IoUring,
-    /// Pointer to the memory shared by the kernel.
-    /// `buffers_count` of `io_uring_buf` structures are shared by the kernel.
-    /// First `io_uring_buf` is overlaid by `io_uring_buf_ring` struct.
-    br: *align(page_size_min) linux.io_uring_buf_ring,
-    /// Contiguous block of memory of size (buffers_count * buffer_size).
-    buffers: []u8,
-    /// Size of each buffer in buffers.
-    buffer_size: u32,
-    /// Number of buffers in `buffers`, number of `io_uring_buf structures` in br.
-    buffers_count: u16,
-    /// Head of unconsumed part of each buffer, if incremental consumption is enabled
-    heads: []u32,
-    /// ID of this group, must be unique in ring.
-    group_id: u16,
-    opt: BufferGroup.Options,
-
-    pub const Options = packed struct {
-        /// If set, buffers consumed from this buffer ring can be consumed
-        /// incrementally. Normally one (or more) buffers are fully consumed.
-        incremental_buffer_consumption: bool = false,
-        /// Receive operation will attempt to fill multiple buffers with rather
-        /// than just pick a single buffer to fill.
-        bundle_receive: bool = false,
-        _: u6 = 0,
-
-        /// Uses kernel version to check if option combination is supported.
-        /// Both bundle receive and incremental buffers since kernel 6.16.
-        /// Incremental buffers since 6.12.
-        /// Bundle receive since 6.10.
-        /// Buffer groups since 6.0.
-        pub fn is_supported(opt: Options) !bool {
-            const required: std.SemanticVersion = .{
-                .major = 6,
-                .minor = if (opt.bundle_receive and opt.incremental_buffer_consumption)
-                    16
-                else if (opt.incremental_buffer_consumption)
-                    12
-                else if (opt.bundle_receive)
-                    10
-                else
-                    0,
-                .patch = 0,
-            };
-            const current = try kernel_version();
-            return !(required.order(current) == .gt);
-        }
-    };
-
-    pub fn init(
-        ring: *IoUring,
-        allocator: Allocator,
-        group_id: u16,
-        buffer_size: u32,
-        buffers_count: u16,
-        opt: BufferGroup.Options,
-    ) !BufferGroup {
-        const buffers = try allocator.alloc(u8, buffer_size * buffers_count);
-        errdefer allocator.free(buffers);
-        const heads = try allocator.alloc(u32, buffers_count);
-        errdefer allocator.free(heads);
-
-        const br = try setup_buf_ring(ring.fd, buffers_count, group_id, .{ .inc = opt.incremental_buffer_consumption });
-        buf_ring_init(br);
-
-        const mask = buf_ring_mask(buffers_count);
-        var i: u16 = 0;
-        while (i < buffers_count) : (i += 1) {
-            const pos = buffer_size * i;
-            const buf = buffers[pos .. pos + buffer_size];
-            heads[i] = 0;
-            buf_ring_add(br, buf, i, mask, i);
-        }
-        buf_ring_advance(br, buffers_count);
-
-        return BufferGroup{
-            .ring = ring,
-            .group_id = group_id,
-            .br = br,
-            .buffers = buffers,
-            .heads = heads,
-            .buffer_size = buffer_size,
-            .buffers_count = buffers_count,
-            .opt = opt,
-        };
-    }
-
-    pub fn deinit(self: *BufferGroup, allocator: Allocator) void {
-        free_buf_ring(self.ring.fd, self.br, self.buffers_count, self.group_id);
-        allocator.free(self.buffers);
-        allocator.free(self.heads);
-    }
-
-    /// Prepare recv operation which will select buffer from this group.
-    pub fn recv(self: *BufferGroup, user_data: u64, fd: linux.fd_t, flags: u32) !*linux.io_uring_sqe {
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_rw(.RECV, fd, 0, 0, 0);
-        sqe.rw_flags = flags;
-        sqe.flags |= linux.IOSQE_BUFFER_SELECT;
-        if (self.opt.bundle_receive) {
-            sqe.ioprio |= linux.IORING_RECVSEND_BUNDLE;
-        }
-        sqe.buf_index = self.group_id;
-        sqe.user_data = user_data;
-        return sqe;
-    }
-
-    /// Prepare multishot recv operation which will select buffer from this group.
-    pub fn recv_multishot(self: *BufferGroup, user_data: u64, fd: linux.fd_t, flags: u32) !*linux.io_uring_sqe {
-        var sqe = try self.recv(user_data, fd, flags);
-        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
-        return sqe;
-    }
-
-    /// Get buffer by id.
-    fn get_by_id(self: *BufferGroup, buffer_id: u16) []u8 {
-        const pos = self.buffer_size * buffer_id;
-        return self.buffers[pos .. pos + self.buffer_size][self.heads[buffer_id]..];
-    }
-
-    /// Get buffer(s) by CQE. If bundle recieve is used this can return two
-    /// buffers when receive data wraps from the end of the self.buffers to the
-    /// beginning. Without bundle receive second buffer is always empty.
-    pub fn get(self: *BufferGroup, cqe: linux.io_uring_cqe) ![2][]u8 {
-        const buffer_id = try cqe.buffer_id();
-        const total_len = @as(usize, @intCast(cqe.res));
-        const head = self.buffer_size * buffer_id + self.heads[buffer_id];
-
-        if (total_len > self.buffers.len - head) {
-            const buf1 = self.buffers[head..];
-            const buf2 = self.buffers[0..(total_len - (self.buffers.len - head))];
-            return .{ buf1, buf2 };
-        }
-        return .{ self.buffers[head..][0..total_len], &.{} };
-    }
-
-    /// Release buffer(s) from CQE to the kernel.
-    pub fn put(self: *BufferGroup, cqe: linux.io_uring_cqe) !void {
-        var buffer_id = try cqe.buffer_id();
-        var total_len = @as(u32, @intCast(cqe.res));
-        const mask = buf_ring_mask(self.buffers_count);
-        var nr_buffers: u16 = 0;
-        while (true) {
-            const this_len = @min(self.buffer_size - self.heads[buffer_id], total_len);
-            total_len -= this_len;
-            if (self.opt.incremental_buffer_consumption and total_len == 0) {
-                // Incremental consumption active, don't release if kernel will
-                // write to the this buffer again.
-                self.heads[buffer_id] += this_len;
-                if (cqe.flags & linux.IORING_CQE_F_BUF_MORE != 0)
-                    break;
-                if (self.opt.bundle_receive and
-                    self.heads[buffer_id] < self.buffer_size)
-                    break;
-            }
-            // Release buffer to the kernel.
-            self.heads[buffer_id] = 0;
-            buf_ring_add(self.br, self.get_by_id(buffer_id), buffer_id, mask, nr_buffers);
-            nr_buffers += 1;
-            buffer_id = (buffer_id + 1) & mask;
-            if (total_len == 0) break;
-        }
-        if (nr_buffers > 0) {
-            buf_ring_advance(self.br, nr_buffers);
-        }
     }
 };
 
@@ -2100,133 +1909,18 @@ pub fn buf_ring_advance(br: *linux.io_uring_buf_ring, count: u16) void {
     @atomicStore(u16, &br.tail, tail, .release);
 }
 
-test BufferGroup {
-    if (builtin.target.cpu.arch.isPowerPC()) return; // https://codeberg.org/ziglang/zig/issues/31562
-    if (!is_linux) return error.SkipZigTest;
-
-    const createSocketTestHarness = @import("IoUring/test.zig").createSocketTestHarness;
-    const skipKernelLessThan = @import("IoUring/test.zig").skipKernelLessThan;
-    try skipKernelLessThan(.{ .major = 6, .minor = 0, .patch = 0 });
-
-    var ring = IoUring.init(16, 0) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
-        error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
-    defer ring.deinit();
-
-    const opts: []const BufferGroup.Options = &.{
-        .{ .bundle_receive = false, .incremental_buffer_consumption = false },
-        .{ .bundle_receive = false, .incremental_buffer_consumption = true },
-        .{ .bundle_receive = true, .incremental_buffer_consumption = false },
-        .{ .bundle_receive = true, .incremental_buffer_consumption = true },
-    };
-
-    // For each options configuration
-    for (opts) |opt| {
-        // Skip if kernel don't support this options
-        if (!try opt.is_supported()) continue;
-
-        // Init buffer group for ring
-        const buffers_count: u16 = 4; // number of buffers in buffer group
-        const buffer_size: usize = 8; // size of each buffer in group
-        var buf_grp = try BufferGroup.init(
-            &ring,
-            testing.allocator,
-            1,
-            buffer_size,
-            buffers_count,
-            opt,
-        );
-        defer buf_grp.deinit(testing.allocator);
-
-        // Create client/server fds
-        const fds = try createSocketTestHarness(&ring);
-        defer fds.close();
-
-        // Prepare send data
-        var data_buf: [buffers_count * buffer_size * 2]u8 = undefined;
-        for (0..data_buf.len) |i| {
-            data_buf[i] = @truncate(i);
-        }
-        // For each size of the send data client sends that data x times and
-        // server receives
-        for (1..data_buf.len) |l| {
-            const data = data_buf[0..l];
-            for (0..10) |i| {
-                // Send
-                {
-                    const user_data = i << 1;
-                    _ = try ring.send(user_data, fds.client, data[0..], 0);
-                    try testing.expectEqual(1, try ring.submit());
-                    const cqe = try ring.copy_cqe();
-                    try testing.expectEqual(user_data, cqe.user_data);
-                    try testing.expectEqual(posix.E.SUCCESS, cqe.err());
-                    try testing.expectEqual(data.len, @as(usize, @intCast(cqe.res)));
-                }
-
-                // Receive until all data is seen
-                var recv_len: usize = 0;
-                while (recv_len < data.len) {
-                    // Submit recv operation, buffer will be chosen from buffer group
-                    const user_data = i << 1 & 1;
-                    _ = try buf_grp.recv(user_data, fds.server, 0);
-                    try testing.expectEqual(1, try ring.submit());
-
-                    // Get completion for recv operation
-                    const cqe = try ring.copy_cqe();
-                    try testing.expectEqual(user_data, cqe.user_data);
-                    try testing.expectEqual(posix.E.SUCCESS, cqe.err());
-                    const len = @as(usize, @intCast(cqe.res));
-
-                    // Get buffer(s) from pool
-                    const buf1, const buf2 = try buf_grp.get(cqe);
-                    if (!opt.bundle_receive) {
-                        // buf2 is used only when bundle recive is enabled
-                        try testing.expectEqual(0, buf2.len);
-                        try testing.expect(buf1.len <= buffer_size);
-                    }
-                    if (!opt.bundle_receive) try testing.expect(buf2.len == 0);
-                    try testing.expectEqual(len, buf1.len + buf2.len);
-
-                    try testing.expectEqualSlices(u8, data[recv_len..][0..len][0..buf1.len], buf1);
-                    try testing.expectEqualSlices(u8, data[recv_len..][0..len][buf1.len..], buf2);
-
-                    // Release buffer(s) to the kernel when application is done with it
-                    try buf_grp.put(cqe);
-                    recv_len += len;
-
-                    // Buffer slots are not changed
-                    const bufs: [*]linux.io_uring_buf = @ptrCast(buf_grp.br);
-                    for (bufs[0..buf_grp.buffers_count], 0..) |buf, bid| {
-                        try testing.expectEqual(buf.bid, bid);
-                        try testing.expectEqual(buffer_size - buf.len, buf_grp.heads[bid]);
-                    }
-                }
-            }
-        }
-    }
-}
-
-test {
-    if (builtin.target.cpu.arch.isPowerPC()) return; // https://codeberg.org/ziglang/zig/issues/31562
-    if (is_linux) _ = @import("IoUring/test.zig");
-}
-
-fn kernel_version() !std.SemanticVersion {
-    var uts: linux.utsname = undefined;
-    const res = linux.uname(&uts);
-    switch (linux.errno(res)) {
-        .SUCCESS => {},
-        else => |errno| return posix.unexpectedErrno(errno),
+// std.os.linux.overrides
+const linuxx = struct {
+    fn io_uring_enter(fd: linux.fd_t, to_submit: u32, min_complete: u32, flags: u32, arg: ?*const anyopaque, sz: u32) usize {
+        return linux.syscall6(.io_uring_enter, @as(u32, @bitCast(fd)), to_submit, min_complete, flags, @intFromPtr(arg), sz);
     }
 
-    const release = std.mem.sliceTo(&uts.release, 0);
-    // Strips potential extra, as kernel version might not be semver compliant, example "6.8.9-300.fc40.x86_64"
-    const extra_index = std.mem.indexOfAny(u8, release, "-+");
-    const stripped = release[0..(extra_index orelse release.len)];
+    pub const IORING_FEAT_MIN_TIMEOUT = 1 << 15;
 
-    var current = try std.SemanticVersion.parse(stripped);
-    current.pre = null; // don't check pre field
-    return current;
-}
+    pub const io_uring_getevents_arg = extern struct {
+        sigmask: u64,
+        sigmask_sz: u32,
+        min_wait_usec: u32,
+        ts: u64,
+    };
+};

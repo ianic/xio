@@ -154,6 +154,8 @@ test "tcp sendfile" {
     defer uring.deinit();
     const io = uring.io();
 
+    _ = try file.length(io);
+
     // Start server on os assigned port
     var addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try addr.listen(io, .{ .reuse_address = true });
@@ -175,6 +177,37 @@ test "tcp sendfile" {
     const file_content = try r.readAlloc(gpa, recv.len - header.len);
     defer gpa.free(file_content);
     try testing.expectEqualSlices(u8, recv[header.len..], file_content);
+}
+
+test "some file operations" {
+    const gpa = testing.allocator;
+    var uring: Uring = undefined;
+    try uring.init(gpa, .{});
+    defer uring.deinit();
+    const io = uring.io();
+
+    const dir = Io.Dir.cwd();
+    const file = try dir.openFile(testing.io, "build.zig.zon", .{});
+    defer file.close(io);
+    const len = try file.length(io);
+    const stat = try file.stat(io);
+    try testing.expectEqual(len, stat.size);
+}
+
+test "some dir operations" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = tmp.dir;
+
+    const gpa = testing.allocator;
+    var uring: Uring = undefined;
+    try uring.init(gpa, .{});
+    defer uring.deinit();
+    const io = uring.io();
+
+    var file = try dir.createFile(io, "pero", .{});
+    defer file.close(io);
+    try testing.expectError(error.NotDir, dir.createDirPath(io, "pero"));
 }
 
 test "batch" {
