@@ -208,6 +208,8 @@ test "some dir operations" {
     var file = try dir.createFile(io, "pero", .{});
     defer file.close(io);
     try testing.expectError(error.NotDir, dir.createDirPath(io, "pero"));
+
+    try file.setPermissions(io, .default_file);
 }
 
 test "batch" {

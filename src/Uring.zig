@@ -53,7 +53,6 @@ allocated_slice: []align(@alignOf(usize)) u8,
 main_fiber_buffer: [
     std.mem.alignForward(usize, @sizeOf(Fiber), @alignOf(Completion)) + @sizeOf(Completion)
 ]u8 align(@max(@alignOf(Fiber), @alignOf(Completion))),
-sync_limit: ?Io.Semaphore,
 
 stderr_writer_initialized: bool = false,
 stderr_mutex: Io.Mutex,
@@ -379,33 +378,29 @@ const CancelRegion = struct {
     const Sync = struct {
         cancel_region: CancelRegion,
         fn init(ev: *Evented) Io.Cancelable!Sync {
-            if (ev.sync_limit) |*sync_limit| try sync_limit.wait(ev.io());
             return .{ .cancel_region = .init(ev) };
         }
         fn initBlocked(ev: *Evented) Sync {
-            if (ev.sync_limit) |*sync_limit| sync_limit.waitUncancelable(ev.io());
             return .{ .cancel_region = .initBlocked(ev) };
         }
-        fn deinit(sync: *Sync, ev: *Evented) void {
+        fn deinit(sync: *Sync) void {
             sync.cancel_region.deinit();
-            if (ev.sync_limit) |*sync_limit| sync_limit.post(ev.io());
         }
 
         const Maybe = union(enum) {
             cancel_region: CancelRegion,
             sync: Sync,
 
-            fn deinit(maybe: *Maybe, ev: *Evented) void {
+            fn deinit(maybe: *Maybe) void {
                 switch (maybe.*) {
                     .cancel_region => |*cancel_region| cancel_region.deinit(),
-                    .sync => |*sync| sync.deinit(ev),
+                    .sync => |*sync| sync.deinit(),
                 }
             }
 
-            fn enterSync(maybe: *Maybe, ev: *Evented) Io.Cancelable!*Sync {
+            fn enterSync(maybe: *Maybe) Io.Cancelable!*Sync {
                 switch (maybe.*) {
                     .cancel_region => |cancel_region| {
-                        if (ev.sync_limit) |*sync_limit| try sync_limit.wait(ev.io());
                         maybe.* = .{ .sync = .{ .cancel_region = cancel_region } };
                     },
                     .sync => {},
@@ -413,11 +408,10 @@ const CancelRegion = struct {
                 return &maybe.sync;
             }
 
-            fn leaveSync(maybe: *Maybe, ev: *Evented) void {
+            fn leaveSync(maybe: *Maybe) void {
                 switch (maybe.*) {
                     .cancel_region => {},
                     .sync => |sync| {
-                        if (ev.sync_limit) |*sync_limit| sync_limit.post(ev.io());
                         maybe.* = .{ .cancel_region = sync.cancel_region };
                     },
                 }
@@ -644,8 +638,6 @@ pub const InitOptions = struct {
     /// Maximum thread pool size (excluding the main thread).
     /// Defaults to one less than the number of logical CPU cores.
     thread_limit: ?usize = 0,
-    /// Maximum number of threads that may perform synchronous syscalls.
-    sync_limit: Io.Limit = .unlimited,
 
     log2_ring_entries: u4 = 10,
 
@@ -665,7 +657,6 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
     ev.* = .{
         .backing_allocator = backing_allocator,
         .main_fiber_buffer = undefined,
-        .sync_limit = if (options.sync_limit.toInt()) |sync_limit| .{ .permits = sync_limit } else null,
 
         .stderr_writer_initialized = false,
         .stderr_mutex = .init,
@@ -1716,7 +1707,7 @@ fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
 fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init(ev) };
-    defer maybe_sync.deinit(ev);
+    defer maybe_sync.deinit();
     return switch (operation) {
         .file_read_streaming => |o| .{
             .file_read_streaming = ev.fileReadStreaming(
@@ -1741,7 +1732,7 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
             },
         },
         .device_io_control => |o| .{
-            .device_io_control = try deviceIoControl(try maybe_sync.enterSync(ev), o),
+            .device_io_control = try deviceIoControl(try maybe_sync.enterSync(), o),
         },
         .net_receive => |o| .{
             .net_receive = r: {
@@ -1845,12 +1836,12 @@ fn deviceIoControl(
 fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init(ev) };
-    defer maybe_sync.deinit(ev);
+    defer maybe_sync.deinit();
     ev.batchDrainSubmitted(&maybe_sync, batch, false) catch |err| switch (err) {
         error.ConcurrencyUnavailable => unreachable, // passed concurrency=false
         error.Canceled => |e| return e,
     };
-    maybe_sync.leaveSync(ev);
+    maybe_sync.leaveSync();
     while (true) {
         batchDrainReady(batch) catch |err| switch (err) {
             error.Timeout => unreachable, // no timeout
@@ -1867,9 +1858,9 @@ fn batchAwaitConcurrent(
 ) Io.Batch.AwaitConcurrentError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init(ev) };
-    defer maybe_sync.deinit(ev);
+    defer maybe_sync.deinit();
     try ev.batchDrainSubmitted(&maybe_sync, batch, true);
-    maybe_sync.leaveSync(ev);
+    maybe_sync.leaveSync();
     const timespec: linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = while (true) {
         batchDrainReady(batch) catch |err| switch (err) {
             error.Timeout => unreachable, // no timeout
@@ -2041,7 +2032,7 @@ fn batchDrainSubmitted(
             .device_io_control => |o| if (concurrency)
                 return error.ConcurrencyUnavailable
             else
-                .{ .device_io_control = try deviceIoControl(try maybe_sync.enterSync(ev), o) },
+                .{ .device_io_control = try deviceIoControl(try maybe_sync.enterSync(), o) },
             .net_receive => |o| {
                 _ = o;
                 @panic("TODO implement batchDrainSubmitted for net_receive");
@@ -2425,7 +2416,7 @@ fn dirAccess(
     const flags: u32 = if (options.follow_symlinks) 0 else linux.AT.SYMLINK_NOFOLLOW;
 
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     while (true) {
         try sync.cancel_region.await(.nothing);
         switch (linux.errno(linux.faccessat(dir.handle, sub_path_posix, mode, flags))) {
@@ -2461,7 +2452,7 @@ fn dirCreateFile(
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
 
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init(ev) };
-    defer maybe_sync.deinit(ev);
+    defer maybe_sync.deinit();
     const fd = ev.openat(&maybe_sync.cancel_region, dir.handle, sub_path_posix, .{
         .ACCMODE = if (flags.read) .RDWR else .WRONLY,
         .CREAT = true,
@@ -2477,7 +2468,7 @@ fn dirCreateFile(
     switch (flags.lock) {
         .none => {},
         .shared, .exclusive => try ev.flock(
-            try maybe_sync.enterSync(ev),
+            try maybe_sync.enterSync(),
             fd,
             flags.lock,
             if (flags.lock_nonblocking) .nonblocking else .blocking,
@@ -2645,7 +2636,7 @@ fn dirOpenFile(
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
 
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init(ev) };
-    defer maybe_sync.deinit(ev);
+    defer maybe_sync.deinit();
     const fd = ev.openat(&maybe_sync.cancel_region, dir.handle, sub_path_posix, .{
         .ACCMODE = switch (flags.mode) {
             .read_only => .RDONLY,
@@ -2677,7 +2668,7 @@ fn dirOpenFile(
     switch (flags.lock) {
         .none => {},
         .shared, .exclusive => try ev.flock(
-            try maybe_sync.enterSync(ev),
+            try maybe_sync.enterSync(),
             fd,
             flags.lock,
             if (flags.lock_nonblocking) .nonblocking else .blocking,
@@ -2701,7 +2692,7 @@ fn dirRead(userdata: ?*anyopaque, dr: *Dir.Reader, buffer: []Dir.Entry) Dir.Read
             // buffered data.
             if (buffer_index != 0) break;
             var sync: CancelRegion.Sync = try .init(ev);
-            defer sync.deinit(ev);
+            defer sync.deinit();
             if (dr.state == .reset) {
                 lseek(&sync, dr.dir.handle, 0, linux.SEEK.SET) catch |err| switch (err) {
                     error.Unseekable => return error.Unexpected,
@@ -2782,7 +2773,7 @@ fn dirRead(userdata: ?*anyopaque, dr: *Dir.Reader, buffer: []Dir.Entry) Dir.Read
 fn dirRealPath(userdata: ?*anyopaque, dir: Dir, out_buffer: []u8) Dir.RealPathError!usize {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     return realPath(&sync, dir.handle, out_buffer);
 }
 
@@ -2798,7 +2789,7 @@ fn dirRealPathFile(
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
 
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init(ev) };
-    defer maybe_sync.deinit(ev);
+    defer maybe_sync.deinit();
     const fd = ev.openat(&maybe_sync.cancel_region, dir.handle, sub_path_posix, .{
         .CLOEXEC = true,
         .PATH = true,
@@ -2809,7 +2800,7 @@ fn dirRealPathFile(
         else => |e| return e,
     };
     defer ev.closeAsync(fd);
-    return realPath(try maybe_sync.enterSync(ev), fd, out_buffer);
+    return realPath(try maybe_sync.enterSync(), fd, out_buffer);
 }
 
 fn dirDeleteFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.DeleteFileError!void {
@@ -3042,7 +3033,7 @@ fn dirReadLink(
     const sub_path_posix = try pathToPosix(sub_path, &sub_path_buffer);
 
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     while (true) {
         try sync.cancel_region.await(.nothing);
         const rc = linux.readlinkat(dir.handle, sub_path_posix, buffer.ptr, buffer.len);
@@ -3072,7 +3063,7 @@ fn dirSetOwner(
 ) Dir.SetOwnerError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     try fchownat(
         &sync,
         dir.handle,
@@ -3095,7 +3086,7 @@ fn dirSetFileOwner(
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     try fchownat(
         &sync,
         dir.handle,
@@ -3113,7 +3104,7 @@ fn dirSetPermissions(
 ) Dir.SetPermissionsError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     fchmodat(
         &sync,
         dir.handle,
@@ -3141,7 +3132,7 @@ fn dirSetFilePermissions(
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     try fchmodat(
         &sync,
         dir.handle,
@@ -3161,7 +3152,7 @@ fn dirSetTimestamps(
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
     var cancel_region: CancelRegion.Sync = try .init(ev);
-    defer cancel_region.deinit(ev);
+    defer cancel_region.deinit();
     try utimensat(
         &cancel_region,
         dir.handle,
@@ -3373,14 +3364,14 @@ fn fileReadPositional(
 fn fileSeekBy(userdata: ?*anyopaque, file: File, offset: i64) File.SeekError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     try lseek(&sync, file.handle, @bitCast(offset), linux.SEEK.CUR);
 }
 
 fn fileSeekTo(userdata: ?*anyopaque, file: File, offset: u64) File.SeekError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     try lseek(&sync, file.handle, offset, linux.SEEK.SET);
 }
 
@@ -3424,7 +3415,7 @@ fn fileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
 fn fileIsTty(userdata: ?*anyopaque, file: File) Io.Cancelable!bool {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     while (true) {
         try sync.cancel_region.await(.nothing);
         var wsz: winsize = undefined;
@@ -3487,7 +3478,7 @@ fn fileSetOwner(
 ) File.SetOwnerError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     try fchownat(
         &sync,
         file.handle,
@@ -3505,7 +3496,7 @@ fn fileSetPermissions(
 ) File.SetPermissionsError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     fchmodat(
         &sync,
         file.handle,
@@ -3529,7 +3520,7 @@ fn fileSetTimestamps(
 ) File.SetTimestampsError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     try utimensat(
         &sync,
         file.handle,
@@ -3545,7 +3536,7 @@ fn fileSetTimestamps(
 fn fileLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     ev.flock(&sync, file.handle, lock, .blocking) catch |err| switch (err) {
         error.WouldBlock => unreachable, // blocking
         else => |e| return e,
@@ -3555,7 +3546,7 @@ fn fileLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!v
 fn fileTryLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!bool {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     ev.flock(&sync, file.handle, lock, switch (lock) {
         .none => .blocking,
         .shared, .exclusive => .nonblocking,
@@ -3569,7 +3560,7 @@ fn fileTryLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockErro
 fn fileUnlock(userdata: ?*anyopaque, file: File) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = .initBlocked(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     ev.flock(&sync, file.handle, .none, .blocking) catch |err| switch (err) {
         error.Canceled => unreachable, // blocked
         error.WouldBlock => unreachable, // blocking
@@ -3582,7 +3573,7 @@ fn fileUnlock(userdata: ?*anyopaque, file: File) void {
 fn fileDowngradeLock(userdata: ?*anyopaque, file: File) File.DowngradeLockError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     ev.flock(&sync, file.handle, .shared, .nonblocking) catch |err| switch (err) {
         error.WouldBlock => return errnoBug(.AGAIN), // File was not locked in exclusive mode.
         error.SystemResources => return errnoBug(.NOLCK), // Lock already obtained.
@@ -3594,7 +3585,7 @@ fn fileDowngradeLock(userdata: ?*anyopaque, file: File) File.DowngradeLockError!
 fn fileRealPath(userdata: ?*anyopaque, file: File, out_buffer: []u8) File.RealPathError!usize {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     return realPath(&sync, file.handle, out_buffer);
 }
 
@@ -3642,7 +3633,7 @@ fn fileMemoryMapCreate(
     const page_align = std.heap.page_size_min;
 
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     const contents = while (true) {
         try sync.cancel_region.await(.nothing);
         const casted_offset = std.math.cast(i64, options.offset) orelse return error.Unseekable;
@@ -3703,7 +3694,7 @@ fn fileMemoryMapSetLength(
     const flags: linux.MREMAP = .{ .MAYMOVE = true };
     const addr_hint: ?[*]const u8 = null;
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     const new_memory = while (true) {
         try sync.cancel_region.await(.nothing);
         const rc = linux.mremap(old_memory.ptr, old_memory.len, new_len, flags, addr_hint);
@@ -3813,7 +3804,7 @@ fn unlockStderr(userdata: ?*anyopaque) void {
 fn processCurrentPath(userdata: ?*anyopaque, buffer: []u8) process.CurrentPathError!usize {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     while (true) {
         try sync.cancel_region.await(.nothing);
         switch (linux.errno(linux.getcwd(buffer.ptr, buffer.len))) {
@@ -3832,7 +3823,7 @@ fn processSetCurrentDir(userdata: ?*anyopaque, dir: Dir) process.SetCurrentDirEr
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     if (dir.handle == linux.AT.FDCWD) return;
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     return fchdir(&sync, dir.handle);
 }
 
@@ -3841,7 +3832,7 @@ fn processSetCurrentPath(userdata: ?*anyopaque, dir_path: []const u8) process.Se
     var path_buffer: [PATH_MAX]u8 = undefined;
     const dir_path_posix = try pathToPosix(dir_path, &path_buffer);
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     return chdir(&sync, dir_path_posix);
 }
 
@@ -3869,7 +3860,7 @@ fn processReplace(userdata: ?*anyopaque, options: process.ReplaceOptions) proces
     };
 
     var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
+    defer sync.deinit();
     return execv(&sync, options.expand_arg0, argv_buf.ptr[0].?, argv_buf.ptr, env_block, PATH);
 }
 
@@ -4315,7 +4306,7 @@ fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitErr
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init(ev) };
-    defer maybe_sync.deinit(ev);
+    defer maybe_sync.deinit();
     defer ev.childCleanup(child);
 
     const pid = child.id.?;
@@ -4343,7 +4334,7 @@ fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitErr
         switch (maybe_sync.cancel_region.errno()) {
             .SUCCESS => {
                 if (child.request_resource_usage_statistics) {
-                    const sync = try maybe_sync.enterSync(ev);
+                    const sync = try maybe_sync.enterSync();
                     while (true) {
                         try sync.cancel_region.await(.nothing);
                         var rusage: linux.rusage = undefined;
@@ -4384,7 +4375,7 @@ fn childKill(userdata: ?*anyopaque, child: *process.Child) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .sync = .initBlocked(ev) };
-    defer maybe_sync.deinit(ev);
+    defer maybe_sync.deinit();
     defer ev.childCleanup(child);
 
     const pid = child.id.?;
@@ -4396,7 +4387,7 @@ fn childKill(userdata: ?*anyopaque, child: *process.Child) void {
         .SRCH => |err| return errnoBug(err) catch {},
         else => |err| return unexpectedErrno(err) catch {},
     };
-    maybe_sync.leaveSync(ev);
+    maybe_sync.leaveSync();
 
     var info: linux.siginfo_t = undefined;
     while (true) {
@@ -4585,7 +4576,7 @@ fn netListenIp(
 ) net.IpAddress.ListenError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init(ev) };
-    defer maybe_sync.deinit(ev);
+    defer maybe_sync.deinit();
     const family = posixAddressFamily(address);
     const socket_fd = try ev.socket(&maybe_sync.cancel_region, family, .{ .mode = options.mode, .protocol = options.protocol });
     errdefer ev.close(socket_fd);
@@ -4663,7 +4654,7 @@ fn netBindIp(
 ) net.IpAddress.BindError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init(ev) };
-    defer maybe_sync.deinit(ev);
+    defer maybe_sync.deinit();
 
     const family = posixAddressFamily(address);
     const socket_fd = try ev.socket(&maybe_sync.cancel_region, family, options);
@@ -4684,7 +4675,7 @@ fn netConnectIp(
 ) net.IpAddress.ConnectError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init(ev) };
-    defer maybe_sync.deinit(ev);
+    defer maybe_sync.deinit();
 
     const family = posixAddressFamily(address);
     const socket_fd = try ev.socket(&maybe_sync.cancel_region, family, .{ .mode = options.mode, .protocol = options.protocol });
@@ -5375,7 +5366,7 @@ fn getsockname(
         }
     }
 
-    const sync = try maybe_sync.enterSync(ev);
+    const sync = try maybe_sync.enterSync();
     while (true) {
         try sync.cancel_region.await(.nothing);
         switch (linux.errno(linux.getsockname(socket_fd, addr, addr_len))) {
