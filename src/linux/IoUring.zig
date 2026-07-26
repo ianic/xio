@@ -11,7 +11,8 @@ const posix = std.posix;
 const linux = std.os.linux;
 const testing = std.testing;
 const page_size_min = std.heap.page_size_min;
-pub const io_uring_sqe = @import("io_uring_sqe.zig").io_uring_sqe;
+pub const Sqe = @import("io_uring_sqe.zig").Sqe;
+const linuxx = @import("linuxx.zig");
 
 fd: linux.fd_t = -1,
 sq: SubmissionQueue,
@@ -150,7 +151,7 @@ pub fn deinit(self: *IoUring) void {
 /// and the null return in liburing is more a C idiom than anything else, for lack of a better
 /// alternative. In Zig, we have first-class error handling... so let's use it.
 /// Matches the implementation of io_uring_get_sqe() in liburing.
-pub fn get_sqe(self: *IoUring) !*io_uring_sqe {
+pub fn get_sqe(self: *IoUring) !*Sqe {
     const head = @atomicLoad(u32, self.sq.head, .acquire);
     // Remember that these head and tail offsets wrap around every four billion operations.
     // We must therefore use wrapping addition and subtraction to avoid a runtime crash.
@@ -440,7 +441,7 @@ pub fn set_iowait(self: *IoUring, enable: bool) !void {
 /// apply to the write, since the fsync may complete before the write is issued to the disk.
 /// You should preferably use `link_with_next_sqe()` on a write's SQE to link it with an fsync,
 /// or else insert a full write barrier using `drain_previous_sqes()` when queueing an fsync.
-pub fn fsync(self: *IoUring, user_data: u64, fd: linux.fd_t, flags: u32) !*io_uring_sqe {
+pub fn fsync(self: *IoUring, user_data: u64, fd: linux.fd_t, flags: u32) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_fsync(fd, flags);
     sqe.user_data = user_data;
@@ -452,7 +453,7 @@ pub fn fsync(self: *IoUring, user_data: u64, fd: linux.fd_t, flags: u32) !*io_ur
 /// A no-op is more useful than may appear at first glance.
 /// For example, you could call `drain_previous_sqes()` on the returned SQE, to use the no-op to
 /// know when the ring is idle before acting on a kill signal.
-pub fn nop(self: *IoUring, user_data: u64) !*io_uring_sqe {
+pub fn nop(self: *IoUring, user_data: u64) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_nop();
     sqe.user_data = user_data;
@@ -488,7 +489,7 @@ pub fn read(
     fd: linux.fd_t,
     buffer: ReadBuffer,
     offset: u64,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     switch (buffer) {
         .buffer => |slice| sqe.prep_read(fd, slice, offset),
@@ -511,7 +512,7 @@ pub fn write(
     fd: linux.fd_t,
     buffer: []const u8,
     offset: u64,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_write(fd, buffer, offset);
     sqe.user_data = user_data;
@@ -532,7 +533,7 @@ pub fn write(
 /// See https://github.com/axboe/liburing/issues/291
 ///
 /// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
-pub fn splice(self: *IoUring, user_data: u64, fd_in: linux.fd_t, off_in: u64, fd_out: linux.fd_t, off_out: u64, len: usize) !*io_uring_sqe {
+pub fn splice(self: *IoUring, user_data: u64, fd_in: linux.fd_t, off_in: u64, fd_out: linux.fd_t, off_out: u64, len: usize) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_splice(fd_in, off_in, fd_out, off_out, len);
     sqe.user_data = user_data;
@@ -551,7 +552,7 @@ pub fn read_fixed(
     buffer: *posix.iovec,
     offset: u64,
     buffer_index: u16,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_read_fixed(fd, buffer, offset, buffer_index);
     sqe.user_data = user_data;
@@ -568,7 +569,7 @@ pub fn writev(
     fd: linux.fd_t,
     iovecs: []const posix.iovec_const,
     offset: u64,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_writev(fd, iovecs, offset);
     sqe.user_data = user_data;
@@ -587,7 +588,7 @@ pub fn write_fixed(
     buffer: *posix.iovec,
     offset: u64,
     buffer_index: u16,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_write_fixed(fd, buffer, offset, buffer_index);
     sqe.user_data = user_data;
@@ -604,7 +605,7 @@ pub fn accept(
     addr: ?*posix.sockaddr,
     addrlen: ?*posix.socklen_t,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_accept(fd, addr, addrlen, flags);
     sqe.user_data = user_data;
@@ -626,7 +627,7 @@ pub fn accept_multishot(
     addr: ?*posix.sockaddr,
     addrlen: ?*posix.socklen_t,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_multishot_accept(fd, addr, addrlen, flags);
     sqe.user_data = user_data;
@@ -651,7 +652,7 @@ pub fn accept_direct(
     addr: ?*posix.sockaddr,
     addrlen: ?*posix.socklen_t,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_accept_direct(fd, addr, addrlen, flags, linux.IORING_FILE_INDEX_ALLOC);
     sqe.user_data = user_data;
@@ -667,7 +668,7 @@ pub fn accept_multishot_direct(
     addr: ?*posix.sockaddr,
     addrlen: ?*posix.socklen_t,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_multishot_accept_direct(fd, addr, addrlen, flags);
     sqe.user_data = user_data;
@@ -682,7 +683,7 @@ pub fn connect(
     fd: linux.fd_t,
     addr: *const posix.sockaddr,
     addrlen: posix.socklen_t,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_connect(fd, addr, addrlen);
     sqe.user_data = user_data;
@@ -698,7 +699,7 @@ pub fn epoll_ctl(
     fd: linux.fd_t,
     op: u32,
     ev: ?*linux.epoll_event,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_epoll_ctl(epfd, fd, op, ev);
     sqe.user_data = user_data;
@@ -728,7 +729,7 @@ pub fn recv(
     fd: linux.fd_t,
     buffer: RecvBuffer,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     switch (buffer) {
         .buffer => |slice| sqe.prep_recv(fd, slice, flags),
@@ -752,7 +753,7 @@ pub fn send(
     fd: linux.fd_t,
     buffer: []const u8,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_send(fd, buffer, flags);
     sqe.user_data = user_data;
@@ -781,7 +782,7 @@ pub fn send_zc(
     buffer: []const u8,
     send_flags: u32,
     zc_flags: u16,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_send_zc(fd, buffer, send_flags, zc_flags);
     sqe.user_data = user_data;
@@ -799,7 +800,7 @@ pub fn send_zc_fixed(
     send_flags: u32,
     zc_flags: u16,
     buf_index: u16,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_send_zc_fixed(fd, buffer, send_flags, zc_flags, buf_index);
     sqe.user_data = user_data;
@@ -815,7 +816,7 @@ pub fn recvmsg(
     fd: linux.fd_t,
     msg: *linux.msghdr,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_recvmsg(fd, msg, flags);
     sqe.user_data = user_data;
@@ -831,7 +832,7 @@ pub fn sendmsg(
     fd: linux.fd_t,
     msg: *const linux.msghdr_const,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_sendmsg(fd, msg, flags);
     sqe.user_data = user_data;
@@ -847,7 +848,7 @@ pub fn sendmsg_zc(
     fd: linux.fd_t,
     msg: *const linux.msghdr_const,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_sendmsg_zc(fd, msg, flags);
     sqe.user_data = user_data;
@@ -864,7 +865,7 @@ pub fn openat(
     path: [*:0]const u8,
     flags: linux.O,
     mode: posix.mode_t,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_openat(fd, path, flags, mode);
     sqe.user_data = user_data;
@@ -890,7 +891,7 @@ pub fn openat_direct(
     flags: linux.O,
     mode: posix.mode_t,
     file_index: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_openat_direct(fd, path, flags, mode, file_index);
     sqe.user_data = user_data;
@@ -900,7 +901,7 @@ pub fn openat_direct(
 /// Queues (but does not submit) an SQE to perform a `close(2)`.
 /// Returns a pointer to the SQE.
 /// Available since 5.6.
-pub fn close(self: *IoUring, user_data: u64, fd: linux.fd_t) !*io_uring_sqe {
+pub fn close(self: *IoUring, user_data: u64, fd: linux.fd_t) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_close(fd);
     sqe.user_data = user_data;
@@ -909,7 +910,7 @@ pub fn close(self: *IoUring, user_data: u64, fd: linux.fd_t) !*io_uring_sqe {
 
 /// Queues close of registered file descriptor.
 /// Available since 5.15
-pub fn close_direct(self: *IoUring, user_data: u64, file_index: u32) !*io_uring_sqe {
+pub fn close_direct(self: *IoUring, user_data: u64, file_index: u32) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_close_direct(file_index);
     sqe.user_data = user_data;
@@ -935,7 +936,7 @@ pub fn timeout(
     ts: *const linux.kernel_timespec,
     count: u32,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_timeout(ts, count, flags);
     sqe.user_data = user_data;
@@ -955,7 +956,7 @@ pub fn timeout_remove(
     user_data: u64,
     timeout_user_data: u64,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_timeout_remove(timeout_user_data, flags);
     sqe.user_data = user_data;
@@ -983,7 +984,7 @@ pub fn link_timeout(
     user_data: u64,
     ts: *const linux.kernel_timespec,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_link_timeout(ts, flags);
     sqe.user_data = user_data;
@@ -997,7 +998,7 @@ pub fn poll_add(
     user_data: u64,
     fd: linux.fd_t,
     poll_mask: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_poll_add(fd, poll_mask);
     sqe.user_data = user_data;
@@ -1010,7 +1011,7 @@ pub fn poll_remove(
     self: *IoUring,
     user_data: u64,
     target_user_data: u64,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_poll_remove(target_user_data);
     sqe.user_data = user_data;
@@ -1026,7 +1027,7 @@ pub fn poll_update(
     new_user_data: u64,
     poll_mask: u32,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_poll_update(old_user_data, new_user_data, poll_mask, flags);
     sqe.user_data = user_data;
@@ -1042,7 +1043,7 @@ pub fn fallocate(
     mode: i32,
     offset: u64,
     len: u64,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_fallocate(fd, mode, offset, len);
     sqe.user_data = user_data;
@@ -1059,7 +1060,7 @@ pub fn statx(
     flags: u32,
     mask: linux.STATX,
     buf: *linux.Statx,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_statx(fd, path, flags, mask, buf);
     sqe.user_data = user_data;
@@ -1079,7 +1080,7 @@ pub fn cancel(
     user_data: u64,
     cancel_user_data: u64,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_cancel(cancel_user_data, flags);
     sqe.user_data = user_data;
@@ -1095,7 +1096,7 @@ pub fn shutdown(
     user_data: u64,
     sockfd: posix.socket_t,
     how: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_shutdown(sockfd, how);
     sqe.user_data = user_data;
@@ -1112,7 +1113,7 @@ pub fn renameat(
     new_dir_fd: linux.fd_t,
     new_path: [*:0]const u8,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_renameat(old_dir_fd, old_path, new_dir_fd, new_path, flags);
     sqe.user_data = user_data;
@@ -1127,7 +1128,7 @@ pub fn unlinkat(
     dir_fd: linux.fd_t,
     path: [*:0]const u8,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_unlinkat(dir_fd, path, flags);
     sqe.user_data = user_data;
@@ -1142,7 +1143,7 @@ pub fn mkdirat(
     dir_fd: linux.fd_t,
     path: [*:0]const u8,
     mode: posix.mode_t,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_mkdirat(dir_fd, path, mode);
     sqe.user_data = user_data;
@@ -1157,7 +1158,7 @@ pub fn symlinkat(
     target: [*:0]const u8,
     new_dir_fd: linux.fd_t,
     link_path: [*:0]const u8,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_symlinkat(target, new_dir_fd, link_path);
     sqe.user_data = user_data;
@@ -1174,7 +1175,7 @@ pub fn linkat(
     new_dir_fd: linux.fd_t,
     new_path: [*:0]const u8,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_linkat(old_dir_fd, old_path, new_dir_fd, new_path, flags);
     sqe.user_data = user_data;
@@ -1195,7 +1196,7 @@ pub fn provide_buffers(
     buffers_count: usize,
     group_id: usize,
     buffer_id: usize,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_provide_buffers(buffers, buffer_size, buffers_count, group_id, buffer_id);
     sqe.user_data = user_data;
@@ -1209,7 +1210,7 @@ pub fn remove_buffers(
     user_data: u64,
     buffers_count: usize,
     group_id: usize,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_remove_buffers(buffers_count, group_id);
     sqe.user_data = user_data;
@@ -1226,7 +1227,7 @@ pub fn waitid(
     infop: *linux.siginfo_t,
     options: u32,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_waitid(id_type, id, infop, options, flags);
     sqe.user_data = user_data;
@@ -1240,7 +1241,7 @@ pub fn pipe(
     user_data: u64,
     fds: *[2]linux.fd_t,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_pipe(fds, flags);
     sqe.user_data = user_data;
@@ -1254,7 +1255,7 @@ pub fn pipe_direct(
     user_data: u64,
     fds: *[2]linux.fd_t,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.pipe(user_data, fds, flags);
     sqe.splice_fd_in = @bitCast(@as(u32, linux.IORING_FILE_INDEX_ALLOC));
     return sqe;
@@ -1484,7 +1485,7 @@ pub fn socket(
     socket_type: u32,
     protocol: u32,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_socket(domain, socket_type, protocol, flags);
     sqe.user_data = user_data;
@@ -1501,7 +1502,7 @@ pub fn socket_direct(
     protocol: u32,
     flags: u32,
     file_index: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_socket_direct(domain, socket_type, protocol, flags, file_index);
     sqe.user_data = user_data;
@@ -1518,7 +1519,7 @@ pub fn socket_direct_alloc(
     socket_type: u32,
     protocol: u32,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_socket_direct_alloc(domain, socket_type, protocol, flags);
     sqe.user_data = user_data;
@@ -1535,7 +1536,7 @@ pub fn bind(
     addr: *const posix.sockaddr,
     addrlen: posix.socklen_t,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_bind(fd, addr, addrlen, flags);
     sqe.user_data = user_data;
@@ -1551,7 +1552,7 @@ pub fn listen(
     fd: linux.fd_t,
     backlog: usize,
     flags: u32,
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_listen(fd, backlog, flags);
     sqe.user_data = user_data;
@@ -1570,7 +1571,7 @@ pub fn cmd_sock(
     optname: u32, // linux.SO
     optval: u64, // pointer to the option value
     optlen: u32, // size of the option value
-) !*io_uring_sqe {
+) !*Sqe {
     const sqe = try self.get_sqe();
     sqe.prep_cmd_sock(cmd_op, fd, level, optname, optval, optlen);
     sqe.user_data = user_data;
@@ -1587,7 +1588,7 @@ pub fn setsockopt(
     level: u32, // linux.SOL
     optname: u32, // linux.SO
     opt: []const u8,
-) !*io_uring_sqe {
+) !*Sqe {
     return try self.cmd_sock(
         user_data,
         .SETSOCKOPT,
@@ -1609,7 +1610,7 @@ pub fn getsockopt(
     level: u32, // linux.SOL
     optname: u32, // linux.SO
     opt: []u8,
-) !*io_uring_sqe {
+) !*Sqe {
     return try self.cmd_sock(
         user_data,
         .GETSOCKOPT,
@@ -1689,7 +1690,7 @@ pub const SubmissionQueue = struct {
     flags: *u32,
     dropped: *u32,
     array: []u32,
-    sqes: []io_uring_sqe,
+    sqes: []Sqe,
     mmap: []align(page_size_min) u8,
     mmap_sqes: []align(page_size_min) u8,
 
@@ -1719,8 +1720,8 @@ pub const SubmissionQueue = struct {
         assert(mmap.len == size);
 
         // The motivation for the `sqes` and `array` indirection is to make it possible for the
-        // application to preallocate static io_uring_sqe entries and then replay them when needed.
-        const size_sqes = p.sq_entries * @sizeOf(io_uring_sqe);
+        // application to preallocate static Sqe entries and then replay them when needed.
+        const size_sqes = p.sq_entries * @sizeOf(Sqe);
         const mmap_sqes = try posix.mmap(
             null,
             size_sqes,
@@ -1741,7 +1742,7 @@ pub const SubmissionQueue = struct {
             array[i] = @intCast(i);
         }
 
-        const sqes: [*]io_uring_sqe = @ptrCast(@alignCast(&mmap_sqes[0]));
+        const sqes: [*]Sqe = @ptrCast(@alignCast(&mmap_sqes[0]));
         // We expect the kernel copies p.sq_entries to the u32 pointed to by p.sq_off.ring_entries,
         // see https://github.com/torvalds/linux/blob/v5.8/fs/io_uring.c#L7843-L7844.
         assert(p.sq_entries == @as(*u32, @ptrCast(@alignCast(&mmap[p.sq_off.ring_entries]))).*);
@@ -1908,19 +1909,3 @@ pub fn buf_ring_advance(br: *linux.io_uring_buf_ring, count: u16) void {
     const tail: u16 = br.tail +% count;
     @atomicStore(u16, &br.tail, tail, .release);
 }
-
-// std.os.linux.overrides
-const linuxx = struct {
-    fn io_uring_enter(fd: linux.fd_t, to_submit: u32, min_complete: u32, flags: u32, arg: ?*const anyopaque, sz: u32) usize {
-        return linux.syscall6(.io_uring_enter, @as(u32, @bitCast(fd)), to_submit, min_complete, flags, @intFromPtr(arg), sz);
-    }
-
-    pub const IORING_FEAT_MIN_TIMEOUT = 1 << 15;
-
-    pub const io_uring_getevents_arg = extern struct {
-        sigmask: u64,
-        sigmask_sz: u32,
-        min_wait_usec: u32,
-        ts: u64,
-    };
-};

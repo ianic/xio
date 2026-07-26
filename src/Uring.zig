@@ -745,7 +745,7 @@ fn currentFiber(ev: *Evented) *Fiber {
     return @fieldParentPtr("context", ev.current_context);
 }
 
-fn enqueue(ev: *Evented) *IoUring.io_uring_sqe {
+fn enqueue(ev: *Evented) *IoUring.Sqe {
     while (true) return ev.io_uring.get_sqe() catch {
         ev.submit();
         continue;
@@ -2306,8 +2306,7 @@ fn filePathKind(ev: *Evented, dir: Dir, sub_path: []const u8) !File.Kind {
     while (true) {
         var statx_buf = std.mem.zeroes(linux.Statx);
         try cancel_region.awaitIoUring(ev);
-        prepStatx(
-            ev.enqueue(),
+        ev.enqueue().statx(
             @intFromPtr(cancel_region.fiber),
             dir.handle,
             sub_path_posix.ptr,
@@ -3219,8 +3218,7 @@ fn fileLength(userdata: ?*anyopaque, file: File) File.LengthError!u64 {
     while (true) {
         var statx_buf = std.mem.zeroes(linux.Statx);
         try cancel_region.awaitIoUring(ev);
-        prepStatx(
-            ev.enqueue(),
+        ev.enqueue().statx(
             @intFromPtr(cancel_region.fiber),
             file.handle,
             "",
@@ -5408,22 +5406,7 @@ fn getsocknameAsync(
 ) !void {
     while (true) {
         try cancel_region.awaitIoUring(ev);
-        ev.enqueue().* = .{
-            .opcode = .URING_CMD,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = socket_fd,
-            .off = @backingInt(linuxx.IO_URING_SOCKET_OP.GETSOCKNAME),
-            .addr = @intFromPtr(addr),
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0, // optlen: 0 - local, 1 - peer
-            .addr3 = @intFromPtr(addr_len),
-            .resv = 0,
-        };
+        ev.enqueue().getsockname(@intFromPtr(cancel_region.fiber), socket_fd, addr, addr_len);
         ev.yield(null, .nothing);
         switch (cancel_region.errno()) {
             .SUCCESS => return,
@@ -5828,8 +5811,7 @@ fn setsockopt(
 ) !void {
     while (true) {
         try cancel_region.awaitIoUring(ev);
-        prepSetsockopt(
-            ev.enqueue(),
+        ev.enqueue().setsockopt(
             @intFromPtr(cancel_region.fiber),
             fd,
             level,
@@ -5870,14 +5852,7 @@ fn socket(
     const mode, const protocol = try posixSocketModeProtocol(family, options.mode, options.protocol);
     const socket_fd = while (true) {
         try cancel_region.awaitIoUring(ev);
-        prepSocket(
-            ev.enqueue(),
-            @intFromPtr(cancel_region.fiber),
-            family,
-            mode | linux.SOCK.CLOEXEC,
-            protocol,
-            0,
-        );
+        ev.enqueue().socket(@intFromPtr(cancel_region.fiber), family, mode | linux.SOCK.CLOEXEC, protocol, 0);
         ev.yield(null, .nothing);
         const completion = cancel_region.completion();
         switch (completion.errno()) {
@@ -5925,7 +5900,7 @@ fn statx(
     while (true) {
         var statx_buf = std.mem.zeroes(linux.Statx);
         try cancel_region.awaitIoUring(ev);
-        prepStatx(ev.enqueue(), @intFromPtr(cancel_region.fiber), dir, path, linux_statx_request, &statx_buf, flags);
+        ev.enqueue().statx(@intFromPtr(cancel_region.fiber), dir, path, linux_statx_request, &statx_buf, flags);
         ev.yield(null, .nothing);
         switch (cancel_region.errno()) {
             .SUCCESS => return statFromLinux(&statx_buf),
@@ -5988,7 +5963,7 @@ fn listen(
 ) !void {
     while (true) {
         try cancel_region.awaitIoUring(ev);
-        prepListen(ev.enqueue(), @intFromPtr(cancel_region.fiber), socket_fd, backlog, 0);
+        ev.enqueue().listen(@intFromPtr(cancel_region.fiber), socket_fd, backlog, 0);
         ev.yield(null, .nothing);
         switch (cancel_region.errno()) {
             .SUCCESS => return,
@@ -6042,13 +6017,7 @@ fn send(
 ) net.Stream.Writer.Error!usize {
     while (true) {
         try cancel_region.awaitIoUring(ev);
-        prepSend(
-            ev.enqueue(),
-            @intFromPtr(cancel_region.fiber),
-            socket_fd,
-            buffer,
-            flags,
-        );
+        ev.enqueue().send(@intFromPtr(cancel_region.fiber), socket_fd, buffer, flags);
         ev.yield(null, .nothing);
         const completion = cancel_region.completion();
         switch (completion.errno()) {
@@ -6069,13 +6038,7 @@ fn sendmsg(
 ) ErrorSet!usize {
     while (true) {
         try cancel_region.awaitIoUring(ev);
-        prepSendmsg(
-            ev.enqueue(),
-            @intFromPtr(cancel_region.fiber),
-            socket_fd,
-            msg,
-            flags,
-        );
+        ev.enqueue().sendmsg(@intFromPtr(cancel_region.fiber), socket_fd, msg, flags);
         ev.yield(null, .nothing);
         const completion = cancel_region.completion();
         switch (completion.errno()) {
@@ -6086,64 +6049,12 @@ fn sendmsg(
     }
 }
 
-fn errnoToError(comptime ErrorSet: type, errno: linux.E) ErrorSet {
-    return switch (ErrorSet) {
-        net.Stream.Writer.Error => switch (errno) {
-            .AFNOSUPPORT => error.AddressFamilyUnsupported,
-            .ALREADY => error.FastOpenAlreadyInProgress,
-            .CONNRESET => error.ConnectionResetByPeer,
-            .HOSTUNREACH => error.HostUnreachable,
-            .NETDOWN => error.NetworkDown,
-            .NETUNREACH => error.NetworkUnreachable,
-            .NOBUFS => error.SystemResources,
-            .NOMEM => error.SystemResources,
-            .NOTCONN => error.SocketUnconnected,
-            .PIPE => error.SocketUnconnected,
-            .ACCES => |err| errnoBug(err),
-            .AGAIN => |err| errnoBug(err),
-            .BADF => |err| errnoBug(err), // File descriptor used after closed.
-            .DESTADDRREQ => |err| errnoBug(err), // The socket is not connection-mode, and no peer address is set.
-            .FAULT => |err| errnoBug(err), // An invalid user space address was specified for an argument.
-            .INVAL => |err| errnoBug(err), // Invalid argument passed.
-            .ISCONN => |err| errnoBug(err), // connection-mode socket was connected already but a recipient was specified
-            .MSGSIZE => |err| errnoBug(err),
-            .NOTSOCK => |err| errnoBug(err), // The file descriptor sockfd does not refer to a socket.
-            .OPNOTSUPP => |err| errnoBug(err), // Some bit in the flags argument is inappropriate for the socket type.
-            else => |err| unexpectedErrno(err),
-        },
-        net.Socket.SendError => switch (errno) {
-            .ACCES => error.AccessDenied,
-            .AFNOSUPPORT => error.AddressFamilyUnsupported,
-            .ALREADY => error.FastOpenAlreadyInProgress,
-            .CONNRESET => error.ConnectionResetByPeer,
-            .HOSTUNREACH => error.HostUnreachable,
-            .MSGSIZE => error.MessageOversize,
-            .NETDOWN => error.NetworkDown,
-            .NETUNREACH => error.NetworkUnreachable,
-            .NOBUFS => error.SystemResources,
-            .NOMEM => error.SystemResources,
-            .NOTCONN => error.SocketUnconnected,
-            .PIPE => error.SocketUnconnected,
-            .BADF => |err| errnoBug(err), // File descriptor used after closed.
-            .DESTADDRREQ => |err| errnoBug(err),
-            .FAULT => |err| errnoBug(err),
-            .INVAL => |err| errnoBug(err),
-            .ISCONN => |err| errnoBug(err),
-            .NOTSOCK => |err| errnoBug(err),
-            .OPNOTSUPP => |err| errnoBug(err),
-            else => |err| unexpectedErrno(err),
-        },
-        else => comptime unreachable,
-    };
-}
-
 pub const PipeAsyncError = PipeError || Io.Cancelable;
 fn pipe2(ev: *Evented, cancel_region: *CancelRegion, flags: linux.O) PipeAsyncError![2]fd_t {
     var fds: [2]fd_t = undefined;
     while (true) {
         try cancel_region.awaitIoUring(ev);
-        prepPipe(
-            ev.enqueue(),
+        ev.enqueue().pipe(
             @intFromPtr(cancel_region.fiber),
             &fds,
             @bitCast(flags),
@@ -6207,8 +6118,7 @@ fn splice(
     const splice_f_nonblock = 0x02;
     while (true) {
         try cancel_region.awaitIoUring(ev);
-        prepSplice(
-            ev.enqueue(),
+        ev.enqueue().splice(
             @intFromPtr(cancel_region.fiber),
             fd_in,
             off_in,
@@ -6255,136 +6165,53 @@ test {
     _ = Fiber.CancelProtection;
 }
 
-// std.os.linux overrides
-const linuxx = struct {
-    pub const IO_URING_SOCKET_OP = enum(u32) {
-        SIOCIN = 0,
-        SIOCOUTQ = 1,
-        GETSOCKOPT = 2,
-        SETSOCKOPT = 3,
-        TX_TIMESTAMP = 4,
-        GETSOCKNAME = 5,
+fn errnoToError(comptime ErrorSet: type, errno: linux.E) ErrorSet {
+    return switch (ErrorSet) {
+        net.Stream.Writer.Error => switch (errno) {
+            .AFNOSUPPORT => error.AddressFamilyUnsupported,
+            .ALREADY => error.FastOpenAlreadyInProgress,
+            .CONNRESET => error.ConnectionResetByPeer,
+            .HOSTUNREACH => error.HostUnreachable,
+            .NETDOWN => error.NetworkDown,
+            .NETUNREACH => error.NetworkUnreachable,
+            .NOBUFS => error.SystemResources,
+            .NOMEM => error.SystemResources,
+            .NOTCONN => error.SocketUnconnected,
+            .PIPE => error.SocketUnconnected,
+            .ACCES => |err| errnoBug(err),
+            .AGAIN => |err| errnoBug(err),
+            .BADF => |err| errnoBug(err), // File descriptor used after closed.
+            .DESTADDRREQ => |err| errnoBug(err), // The socket is not connection-mode, and no peer address is set.
+            .FAULT => |err| errnoBug(err), // An invalid user space address was specified for an argument.
+            .INVAL => |err| errnoBug(err), // Invalid argument passed.
+            .ISCONN => |err| errnoBug(err), // connection-mode socket was connected already but a recipient was specified
+            .MSGSIZE => |err| errnoBug(err),
+            .NOTSOCK => |err| errnoBug(err), // The file descriptor sockfd does not refer to a socket.
+            .OPNOTSUPP => |err| errnoBug(err), // Some bit in the flags argument is inappropriate for the socket type.
+            else => |err| unexpectedErrno(err),
+        },
+        net.Socket.SendError => switch (errno) {
+            .ACCES => error.AccessDenied,
+            .AFNOSUPPORT => error.AddressFamilyUnsupported,
+            .ALREADY => error.FastOpenAlreadyInProgress,
+            .CONNRESET => error.ConnectionResetByPeer,
+            .HOSTUNREACH => error.HostUnreachable,
+            .MSGSIZE => error.MessageOversize,
+            .NETDOWN => error.NetworkDown,
+            .NETUNREACH => error.NetworkUnreachable,
+            .NOBUFS => error.SystemResources,
+            .NOMEM => error.SystemResources,
+            .NOTCONN => error.SocketUnconnected,
+            .PIPE => error.SocketUnconnected,
+            .BADF => |err| errnoBug(err), // File descriptor used after closed.
+            .DESTADDRREQ => |err| errnoBug(err),
+            .FAULT => |err| errnoBug(err),
+            .INVAL => |err| errnoBug(err),
+            .ISCONN => |err| errnoBug(err),
+            .NOTSOCK => |err| errnoBug(err),
+            .OPNOTSUPP => |err| errnoBug(err),
+            else => |err| unexpectedErrno(err),
+        },
+        else => comptime unreachable,
     };
-};
-
-fn prepSplice(
-    sqe: *IoUring.io_uring_sqe,
-    user_data: u64,
-    fd_in: linux.fd_t,
-    off_in: u64,
-    fd_out: linux.fd_t,
-    off_out: u64,
-    len: usize,
-    flags: u32,
-) void {
-    sqe.prep_rw(.SPLICE, fd_out, off_in, len, off_out);
-    sqe.splice_fd_in = fd_in;
-    sqe.user_data = user_data;
-    sqe.rw_flags = flags;
 }
-
-fn prepPipe(
-    sqe: *IoUring.io_uring_sqe,
-    user_data: u64,
-    fds: *[2]linux.fd_t,
-    flags: u32,
-) void {
-    const OP_PIPE = 62;
-    sqe.prep_rw(@fromBackingInt(@intCast(OP_PIPE)), 0, @intFromPtr(fds), 0, 0);
-    sqe.user_data = user_data;
-    sqe.rw_flags = flags;
-}
-
-fn prepListen(
-    sqe: *IoUring.io_uring_sqe,
-    user_data: u64,
-    fd: linux.fd_t,
-    backlog: usize,
-    flags: u32,
-) void {
-    sqe.prep_rw(.LISTEN, fd, 0, backlog, 0);
-    sqe.user_data = user_data;
-    sqe.rw_flags = flags;
-}
-
-fn prepStatx(
-    sqe: *IoUring.io_uring_sqe,
-    user_data: u64,
-    fd: linux.fd_t,
-    path: [*:0]const u8,
-    mask: linux.STATX,
-    buf: *linux.Statx,
-    flags: u32,
-) void {
-    sqe.prep_rw(.STATX, fd, @intFromPtr(path), @as(u32, @bitCast(mask)), @intFromPtr(buf));
-    sqe.user_data = user_data;
-    sqe.rw_flags = flags;
-}
-
-fn prepSendmsg(
-    sqe: *IoUring.io_uring_sqe,
-    user_data: u64,
-    fd: linux.fd_t,
-    msg: *const linux.msghdr_const,
-    flags: u32,
-) void {
-    sqe.prep_rw(.SENDMSG, fd, @intFromPtr(msg), 1, 0);
-    sqe.user_data = user_data;
-    sqe.rw_flags = flags;
-}
-
-fn prepSend(
-    sqe: *IoUring.io_uring_sqe,
-    user_data: u64,
-    fd: linux.fd_t,
-    buffer: []const u8,
-    flags: u32,
-) void {
-    sqe.prep_rw(.SEND, fd, @intFromPtr(buffer.ptr), buffer.len, 0);
-    sqe.user_data = user_data;
-    sqe.rw_flags = flags;
-}
-
-pub fn prepSocket(
-    sqe: *IoUring.io_uring_sqe,
-    user_data: u64,
-    domain: u32,
-    socket_type: u32,
-    protocol: u32,
-    flags: u32,
-) void {
-    sqe.prep_rw(.SOCKET, @intCast(domain), 0, protocol, socket_type);
-    sqe.user_data = user_data;
-    sqe.rw_flags = flags;
-}
-
-pub fn prepSetsockopt(
-    sqe: *IoUring.io_uring_sqe,
-    user_data: u64,
-    fd: fd_t,
-    level: i32,
-    opt_name: u32,
-    optval: u64,
-    optlen: u32,
-) void {
-    sqe.prep_rw(.URING_CMD, fd, 0, 0, 0);
-    sqe.user_data = user_data;
-
-    const off: extern struct {
-        cmd_op: linux.IO_URING_SOCKET_OP,
-        pad: u32,
-    } align(@alignOf(u64)) = .{
-        .cmd_op = .SETSOCKOPT,
-        .pad = 0,
-    };
-    const addr: extern struct { level: i32, opt_name: u32 } align(@alignOf(u64)) = .{
-        .level = level,
-        .opt_name = opt_name,
-    };
-    sqe.off = @as(*const u64, @ptrCast(&off)).*;
-    sqe.addr = @as(*const u64, @ptrCast(&addr)).*;
-    sqe.splice_fd_in = @intCast(optlen);
-    sqe.addr3 = optval;
-}
-
-// prep_rw: opcode, fd, addr, len, off
