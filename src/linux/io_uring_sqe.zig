@@ -876,6 +876,30 @@ pub const Sqe = extern struct {
         sqe.user_data = user_data;
     }
 
+    pub fn write(
+        sqe: *Sqe,
+        user_data: u64,
+        fd: linux.fd_t,
+        buffer: []const u8,
+        offset: ?u64,
+    ) void {
+        const off = offset orelse std.math.maxInt(u64);
+        sqe.prep_rw(.WRITE, fd, @intFromPtr(buffer.ptr), buffer.len, off);
+        sqe.user_data = user_data;
+    }
+
+    pub fn writev(
+        sqe: *Sqe,
+        user_data: u64,
+        fd: linux.fd_t,
+        iovecs: []const std.posix.iovec_const,
+        offset: ?u64,
+    ) void {
+        const off = offset orelse std.math.maxInt(u64);
+        sqe.prep_rw(.WRITEV, fd, @intFromPtr(iovecs.ptr), iovecs.len, off);
+        sqe.user_data = user_data;
+    }
+
     pub const empty = .{
         .opcode = 0,
         .flags = 0,

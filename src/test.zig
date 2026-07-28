@@ -221,9 +221,12 @@ test "some file operations" {
         try testing.expectEqualSlices(u8, "footer\n", &buf2);
         try testing.expectEqualSlices(u8, &buf3, &buf2);
 
-        // var buf2: [1024]u8 = undefined;
-        // n = try file.readPositional(io, &.{&buf2}, 0);
-        // std.debug.print("{s}", .{buf2[0..n]});
+        n = try file.writePositional(io, &.{ "line3\n", "line4\n" }, 7);
+        try testing.expectEqual(12, n);
+
+        // var buf4: [1024]u8 = undefined;
+        // n = try file.readPositional(io, &.{&buf4}, 0);
+        // std.debug.print("{s}", .{buf4[0..n]});
     }
     {
         const file = try dir.openFile(testing.io, "file1", .{});

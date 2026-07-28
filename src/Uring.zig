@@ -1620,37 +1620,7 @@ fn fileWriteStreaming(
     data: []const []const u8,
     splat: usize,
 ) File.Writer.Error!usize {
-    var iovecs: [max_iovecs_len]iovec_const = undefined;
-    var iovlen: iovlen_t = 0;
-    addBuf(&iovecs, &iovlen, header);
-    for (data[0 .. data.len - 1]) |bytes| addBuf(&iovecs, &iovlen, bytes);
-    const pattern = data[data.len - 1];
-    var backup_buffer: [splat_buffer_size]u8 = undefined;
-    if (iovecs.len - iovlen != 0) switch (splat) {
-        0 => {},
-        1 => addBuf(&iovecs, &iovlen, pattern),
-        else => switch (pattern.len) {
-            0 => {},
-            1 => {
-                const splat_buffer = &backup_buffer;
-                const memset_len = @min(splat_buffer.len, splat);
-                const buf = splat_buffer[0..memset_len];
-                @memset(buf, pattern[0]);
-                addBuf(&iovecs, &iovlen, buf);
-                var remaining_splat = splat - buf.len;
-                while (remaining_splat > splat_buffer.len and iovecs.len - iovlen != 0) {
-                    assert(buf.len == splat_buffer.len);
-                    addBuf(&iovecs, &iovlen, splat_buffer);
-                    remaining_splat -= splat_buffer.len;
-                }
-                addBuf(&iovecs, &iovlen, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
-            },
-            else => for (0..@min(splat, iovecs.len - iovlen)) |_| {
-                addBuf(&iovecs, &iovlen, pattern);
-            },
-        },
-    };
-    return ev.pwritev(file.handle, iovecs[0..iovlen], null);
+    return ev.pwritev(file.handle, header, data, splat, null);
 }
 
 fn deviceIoControl(ev: *Evented, o: Io.Operation.DeviceIoControl) Io.Cancelable!i32 {
@@ -2997,51 +2967,7 @@ fn fileWritePositional(
     offset: u64,
 ) File.WritePositionalError!usize {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-
-    var iovecs: [max_iovecs_len]iovec_const = undefined;
-    var iovlen: iovlen_t = 0;
-    addBuf(&iovecs, &iovlen, header);
-    for (data[0 .. data.len - 1]) |bytes| addBuf(&iovecs, &iovlen, bytes);
-    const pattern = data[data.len - 1];
-    var backup_buffer: [splat_buffer_size]u8 = undefined;
-    if (iovecs.len - iovlen != 0) switch (splat) {
-        0 => {},
-        1 => addBuf(&iovecs, &iovlen, pattern),
-        else => switch (pattern.len) {
-            0 => {},
-            1 => {
-                const splat_buffer = &backup_buffer;
-                const memset_len = @min(splat_buffer.len, splat);
-                const buf = splat_buffer[0..memset_len];
-                @memset(buf, pattern[0]);
-                addBuf(&iovecs, &iovlen, buf);
-                var remaining_splat = splat - buf.len;
-                while (remaining_splat > splat_buffer.len and iovecs.len - iovlen != 0) {
-                    assert(buf.len == splat_buffer.len);
-                    addBuf(&iovecs, &iovlen, splat_buffer);
-                    remaining_splat -= splat_buffer.len;
-                }
-                addBuf(&iovecs, &iovlen, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
-            },
-            else => for (0..@min(splat, iovecs.len - iovlen)) |_| {
-                addBuf(&iovecs, &iovlen, pattern);
-            },
-        },
-    };
-
-    return ev.pwritev(file.handle, iovecs[0..iovlen], offset);
-}
-
-/// This is either usize or u32. Since, either is fine, let's use the same
-/// `addBuf` function for both writing to a file and sending network messages.
-const iovlen_t = @FieldType(linux.msghdr_const, "iovlen");
-
-fn addBuf(v: []iovec_const, i: *iovlen_t, bytes: []const u8) void {
-    // OS checks ptr addr before length so zero length vectors must be omitted.
-    if (bytes.len == 0) return;
-    if (v.len - i.* == 0) return;
-    v[i.*] = .{ .base = bytes.ptr, .len = bytes.len };
-    i.* += 1;
+    return ev.pwritev(file.handle, header, data, splat, offset);
 }
 
 fn fileWriteFileStreaming(
@@ -4527,47 +4453,17 @@ fn netWrite(
     splat: usize,
 ) net.Stream.Writer.Error!usize {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-
     var iovecs: [max_iovecs_len]iovec_const = undefined;
+    const iov = fillIovecs(&iovecs, header, data, splat);
     var msg: linux.msghdr_const = .{
         .name = null,
         .namelen = 0,
-        .iov = &iovecs,
-        .iovlen = 0,
+        .iov = iov.ptr,
+        .iovlen = iov.len,
         .control = null,
         .controllen = 0,
         .flags = 0,
     };
-    addBuf(&iovecs, &msg.iovlen, header);
-    for (data[0 .. data.len - 1]) |bytes| addBuf(&iovecs, &msg.iovlen, bytes);
-    const pattern = data[data.len - 1];
-
-    var splat_backup_buffer: [splat_buffer_size]u8 = undefined;
-    if (iovecs.len - msg.iovlen != 0) switch (splat) {
-        0 => {},
-        1 => addBuf(&iovecs, &msg.iovlen, pattern),
-        else => switch (pattern.len) {
-            0 => {},
-            1 => {
-                const splat_buffer = &splat_backup_buffer;
-                const memset_len = @min(splat_buffer.len, splat);
-                const buf = splat_buffer[0..memset_len];
-                @memset(buf, pattern[0]);
-                addBuf(&iovecs, &msg.iovlen, buf);
-                var remaining_splat = splat - buf.len;
-                while (remaining_splat > splat_buffer.len and iovecs.len - msg.iovlen != 0) {
-                    assert(buf.len == splat_buffer.len);
-                    addBuf(&iovecs, &msg.iovlen, splat_buffer);
-                    remaining_splat -= splat_buffer.len;
-                }
-                addBuf(&iovecs, &msg.iovlen, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
-            },
-            else => for (0..@min(splat, iovecs.len - msg.iovlen)) |_| {
-                addBuf(&iovecs, &msg.iovlen, pattern);
-            },
-        },
-    };
-
     return ev.sendmsg(handle, &msg, linux.MSG.NOSIGNAL, net.Stream.Writer.Error);
 }
 
@@ -5205,47 +5101,27 @@ fn preadv(
     }
 }
 
-fn pwritev(ev: *Evented, fd: fd_t, iov: []const iovec_const, offset: ?u64) File.Writer.Error!usize {
+fn pwritev(
+    ev: *Evented,
+    fd: fd_t,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+    offset: ?u64,
+) File.Writer.Error!usize {
+    var iovecs: [max_iovecs_len]iovec_const = undefined;
+    const iov = fillIovecs(&iovecs, header, data, splat);
+
     if (iov.len == 0) return 0;
-    const scatter = iov.len > 1 or iov[0].len > 0xfffff000;
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = if (scatter) .WRITEV else .WRITE,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = fd,
-            .off = offset orelse std.math.maxInt(u64),
-            .addr = if (scatter) @intFromPtr(iov.ptr) else @intFromPtr(iov[0].base),
-            .len = @intCast(if (scatter) iov.len else iov[0].len),
-            .rw_flags = 0,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.writev(@intFromPtr(fiber), fd, iov, offset);
         ev.yield(null, .nothing);
         const completion = fiber.completion();
         switch (completion.errno()) {
             .SUCCESS => return @as(u32, @bitCast(completion.result)),
             .INTR, .CANCELED => {},
-            .INVAL => |err| return errnoBug(err),
-            .FAULT => |err| return errnoBug(err),
-            .AGAIN => return error.WouldBlock,
-            .BADF => return error.NotOpenForWriting, // Can be a race condition.
-            .DESTADDRREQ => |err| return errnoBug(err), // `connect` was never called.
-            .DQUOT => return error.DiskQuota,
-            .FBIG => return error.FileTooBig,
-            .IO => return error.InputOutput,
-            .NOSPC => return error.NoSpaceLeft,
-            .PERM => return error.PermissionDenied,
-            .PIPE => return error.BrokenPipe,
-            .CONNRESET => |err| return errnoBug(err), // Not a socket handle.
-            .BUSY => return error.DeviceBusy,
-            .ACCES => return error.AccessDenied,
-            else => |err| return unexpectedErrno(err),
+            else => |errno| return errnoToError(File.Writer.Error, errno),
         }
     }
 }
@@ -5673,8 +5549,50 @@ fn timeoutToLinux(timeout: Io.Timeout) struct { ?linux.kernel_timespec, u32 } {
     };
 }
 
-test {
-    _ = Fiber.CancelProtection;
+fn fillIovecs(
+    iovecs: []iovec_const,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+) []iovec_const {
+    var iovlen: usize = 0;
+    addBuf(iovecs, &iovlen, header);
+    for (data[0 .. data.len - 1]) |bytes| addBuf(iovecs, &iovlen, bytes);
+    const pattern = data[data.len - 1];
+    var backup_buffer: [splat_buffer_size]u8 = undefined;
+    if (iovecs.len - iovlen != 0) switch (splat) {
+        0 => {},
+        1 => addBuf(iovecs, &iovlen, pattern),
+        else => switch (pattern.len) {
+            0 => {},
+            1 => {
+                const splat_buffer = &backup_buffer;
+                const memset_len = @min(splat_buffer.len, splat);
+                const buf = splat_buffer[0..memset_len];
+                @memset(buf, pattern[0]);
+                addBuf(iovecs, &iovlen, buf);
+                var remaining_splat = splat - buf.len;
+                while (remaining_splat > splat_buffer.len and iovecs.len - iovlen != 0) {
+                    assert(buf.len == splat_buffer.len);
+                    addBuf(iovecs, &iovlen, splat_buffer);
+                    remaining_splat -= splat_buffer.len;
+                }
+                addBuf(iovecs, &iovlen, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
+            },
+            else => for (0..@min(splat, iovecs.len - iovlen)) |_| {
+                addBuf(iovecs, &iovlen, pattern);
+            },
+        },
+    };
+    return iovecs[0..iovlen];
+}
+
+fn addBuf(v: []iovec_const, i: *usize, bytes: []const u8) void {
+    // OS checks ptr addr before length so zero length vectors must be omitted.
+    if (bytes.len == 0) return;
+    if (v.len - i.* == 0) return;
+    v[i.*] = .{ .base = bytes.ptr, .len = bytes.len };
+    i.* += 1;
 }
 
 fn errnoToError(comptime ErrorSet: type, errno: linux.E) ErrorSet {
@@ -5701,6 +5619,23 @@ fn errnoToError(comptime ErrorSet: type, errno: linux.E) ErrorSet {
             .NOTSOCK => |err| errnoBug(err), // The file descriptor sockfd does not refer to a socket.
             .OPNOTSUPP => |err| errnoBug(err), // Some bit in the flags argument is inappropriate for the socket type.
             else => |err| unexpectedErrno(err),
+        },
+        File.Writer.Error => switch (errno) {
+            .INVAL => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .AGAIN => return error.WouldBlock,
+            .BADF => return error.NotOpenForWriting, // Can be a race condition.
+            .DESTADDRREQ => |err| return errnoBug(err), // `connect` was never called.
+            .DQUOT => return error.DiskQuota,
+            .FBIG => return error.FileTooBig,
+            .IO => return error.InputOutput,
+            .NOSPC => return error.NoSpaceLeft,
+            .PERM => return error.PermissionDenied,
+            .PIPE => return error.BrokenPipe,
+            .CONNRESET => |err| return errnoBug(err), // Not a socket handle.
+            .BUSY => return error.DeviceBusy,
+            .ACCES => return error.AccessDenied,
+            else => |err| return unexpectedErrno(err),
         },
         net.Socket.SendError => switch (errno) {
             .ACCES => error.AccessDenied,
@@ -5765,4 +5700,8 @@ fn errnoToError(comptime ErrorSet: type, errno: linux.E) ErrorSet {
         },
         else => comptime unreachable,
     };
+}
+
+test {
+    _ = Fiber.CancelProtection;
 }
