@@ -822,4 +822,74 @@ pub const Sqe = extern struct {
         sqe.splice_fd_in = 0; // optlen: 0 - local, 1 - peer
         sqe.addr3 = @intFromPtr(addr_len);
     }
+
+    pub fn asyncCancel(
+        sqe: *Sqe,
+        user_data: u64,
+        cancel_user_data: u64,
+    ) void {
+        sqe.prep_rw(.ASYNC_CANCEL, -1, cancel_user_data, 0, 0);
+        sqe.user_data = user_data;
+        sqe.flags = linux.IOSQE_CQE_SKIP_SUCCESS;
+    }
+
+    pub fn nop(sqe: *Sqe, user_data: u64) void {
+        sqe.* = .{
+            .opcode = .NOP,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = 0,
+            .off = 0,
+            .addr = 0,
+            .len = 0,
+            .rw_flags = 0,
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+
+    pub fn read(
+        sqe: *Sqe,
+        user_data: u64,
+        fd: linux.fd_t,
+        buffer: []u8,
+        offset: ?u64,
+    ) void {
+        const off = offset orelse std.math.maxInt(u64);
+        sqe.prep_rw(.READ, fd, @intFromPtr(buffer.ptr), buffer.len, off);
+        sqe.user_data = user_data;
+    }
+
+    pub fn readv(
+        sqe: *Sqe,
+        user_data: u64,
+        fd: linux.fd_t,
+        iovecs: []const std.posix.iovec,
+        offset: ?u64,
+    ) void {
+        const off = offset orelse std.math.maxInt(u64);
+        sqe.prep_rw(.READV, fd, @intFromPtr(iovecs.ptr), iovecs.len, off);
+        sqe.user_data = user_data;
+    }
+
+    pub const empty = .{
+        .opcode = 0,
+        .flags = 0,
+        .ioprio = 0,
+        .fd = 0,
+        .off = 0,
+        .addr = 0,
+        .len = 0,
+        .rw_flags = 0,
+        .user_data = 0,
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .addr3 = 0,
+        .resv = 0,
+    };
 };

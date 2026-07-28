@@ -161,7 +161,7 @@ test "tcp sendfile" {
     var server = try addr.listen(io, .{ .reuse_address = true });
     addr = server.socket.address;
 
-    // Run client adn server
+    // Run client and server
     var f_server = io.async(S.server, .{ gpa, io, &server });
     var f_client = io.async(S.client, .{ io, addr, file, header, offset, limit });
     const recv = try f_server.await(io);
@@ -181,17 +181,58 @@ test "tcp sendfile" {
 
 test "some file operations" {
     const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = tmp.dir;
+
     var uring: Uring = undefined;
     try uring.init(gpa, .{});
     defer uring.deinit();
     const io = uring.io();
 
-    const dir = Io.Dir.cwd();
-    const file = try dir.openFile(testing.io, "build.zig.zon", .{});
-    defer file.close(io);
-    const len = try file.length(io);
-    const stat = try file.stat(io);
-    try testing.expectEqual(len, stat.size);
+    {
+        try dir.createDir(io, "folder1", .default_dir);
+        try dir.createDirPath(io, "folder2/folder21");
+        const dir2 = try dir.createDirPathOpen(io, "folder3/folder31", .{});
+        defer dir2.close(io);
+        const stat = try dir2.stat(io);
+        try testing.expectEqual(.directory, stat.kind);
+        try dir.rename("folder1", dir2, "folder32", io);
+    }
+    { // sync operations
+        try testing.expectError(error.FileNotFound, dir.access(io, "folder1", .{}));
+        try dir.createDir(io, "folder1", .default_dir);
+        try dir.access(io, "folder1", .{ .read = true, .write = true });
+    }
+    {
+        const file = try dir.createFile(io, "file1", .{ .read = true });
+        var n = try file.writeStreaming(io, "header\n", &.{ "line1\n", "line2\n", "footer\n" }, 2);
+        try testing.expectEqual(33, n);
+
+        var buf1: [5]u8 = undefined;
+        n = try file.readPositional(io, &.{&buf1}, 7);
+        try testing.expectEqualSlices(u8, "line1", buf1[0..n]);
+
+        var buf2: [7]u8 = undefined;
+        var buf3: [7]u8 = undefined;
+
+        n = try file.readPositional(io, &.{ &buf2, &buf3 }, 19);
+        try testing.expectEqual(14, n);
+        try testing.expectEqualSlices(u8, "footer\n", &buf2);
+        try testing.expectEqualSlices(u8, &buf3, &buf2);
+
+        // var buf2: [1024]u8 = undefined;
+        // n = try file.readPositional(io, &.{&buf2}, 0);
+        // std.debug.print("{s}", .{buf2[0..n]});
+    }
+    {
+        const file = try dir.openFile(testing.io, "file1", .{});
+        defer file.close(io);
+        const len = try file.length(io);
+        const stat = try file.stat(io);
+        try testing.expectEqual(33, len);
+        try testing.expectEqual(len, stat.size);
+    }
 }
 
 test "some dir operations" {
