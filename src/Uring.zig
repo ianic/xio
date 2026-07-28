@@ -2910,7 +2910,7 @@ fn dirHardLink(
         old_sub_path_posix,
         new_dir.handle,
         new_sub_path_posix,
-        if (options.follow_symlinks) 0 else linux.AT.SYMLINK_NOFOLLOW,
+        if (options.follow_symlinks) linux.AT.SYMLINK_FOLLOW else 0,
     );
 }
 
@@ -3233,7 +3233,7 @@ fn fileHardLink(
         "",
         new_dir.handle,
         new_sub_path_posix,
-        linux.AT.EMPTY_PATH | @as(u32, if (options.follow_symlinks) 0 else linux.AT.SYMLINK_NOFOLLOW),
+        linux.AT.EMPTY_PATH | @as(u32, if (options.follow_symlinks) linux.AT.SYMLINK_FOLLOW else 0),
     );
 }
 
@@ -4912,6 +4912,8 @@ fn linkat(
     new_path: [*:0]const u8,
     flags: u32,
 ) File.HardLinkError!void {
+    // allowed flags: https://man7.org/linux/man-pages/man2/linkat.2.html
+    assert(flags & ~(@as(u32, linux.AT.SYMLINK_FOLLOW | linux.AT.EMPTY_PATH)) == 0);
     while (true) {
         const sqe, const fiber = try ev.enqueue();
         sqe.* = .{
