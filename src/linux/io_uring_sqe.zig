@@ -683,8 +683,11 @@ pub const Sqe = extern struct {
 
     /// This SQE forms a link with the next SQE in the submission ring. Next SQE
     /// will not be started before this one completes. Forms a chain of SQEs.
-    pub fn link_next(sqe: *Sqe) void {
+    pub fn linkNext(sqe: *Sqe) void {
         sqe.flags |= linux.IOSQE_IO_LINK;
+    }
+    pub fn skipSuccess(sqe: *Sqe) void {
+        sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
     }
 
     pub fn splice(
@@ -860,7 +863,7 @@ pub const Sqe = extern struct {
         offset: ?u64,
     ) void {
         const off = offset orelse std.math.maxInt(u64);
-        sqe.prep_rw(.READ, fd, @intFromPtr(buffer.ptr), buffer.len, off);
+        sqe.prep_rw(.READ, fd, @intFromPtr(buffer.ptr), @min(buffer.len, 0xfffff000), off);
         sqe.user_data = user_data;
     }
 
@@ -898,6 +901,417 @@ pub const Sqe = extern struct {
         const off = offset orelse std.math.maxInt(u64);
         sqe.prep_rw(.WRITEV, fd, @intFromPtr(iovecs.ptr), iovecs.len, off);
         sqe.user_data = user_data;
+    }
+
+    pub fn connect(
+        sqe: *Sqe,
+        user_data: u64,
+        fd: linux.fd_t,
+        addr: *const linux.sockaddr,
+        addr_len: linux.socklen_t,
+    ) void {
+        sqe.prep_rw(.CONNECT, fd, @intFromPtr(addr), 0, addr_len);
+        sqe.user_data = user_data;
+    }
+
+    pub fn bind(
+        sqe: *Sqe,
+        user_data: u64,
+        fd: linux.fd_t,
+        addr: *const linux.sockaddr,
+        addrlen: linux.socklen_t,
+    ) void {
+        sqe.prep_rw(.BIND, fd, @intFromPtr(addr), 0, addrlen);
+        sqe.user_data = user_data;
+    }
+
+    pub fn linkTimeout(
+        sqe: *Sqe,
+        user_data: u64,
+        ts: *const linux.kernel_timespec,
+        flags: u32,
+    ) void {
+        sqe.prep_rw(.LINK_TIMEOUT, -1, @intFromPtr(ts), 1, 0);
+        sqe.rw_flags = flags;
+        sqe.user_data = user_data;
+    }
+
+    pub fn shutdown(
+        sqe: *Sqe,
+        user_data: u64,
+        sockfd: linux.socket_t,
+        how: u32,
+    ) void {
+        sqe.prep_rw(.SHUTDOWN, sockfd, 0, how, 0);
+        sqe.user_data = user_data;
+    }
+
+    pub fn recvmsg(
+        sqe: *Sqe,
+        user_data: u64,
+        fd: linux.fd_t,
+        msg: *linux.msghdr,
+        flags: u32,
+    ) void {
+        sqe.prep_rw(.RECVMSG, fd, @intFromPtr(msg), 1, 0);
+        sqe.user_data = user_data;
+        sqe.rw_flags = flags;
+    }
+
+    pub fn accept(
+        sqe: *Sqe,
+        user_data: u64,
+        fd: linux.fd_t,
+        addr: ?*linux.sockaddr,
+        addrlen: ?*linux.socklen_t,
+        flags: u32,
+    ) void {
+        sqe.prep_rw(.ACCEPT, fd, @intFromPtr(addr), 0, @intFromPtr(addrlen));
+        sqe.user_data = user_data;
+        sqe.rw_flags = flags;
+    }
+
+    pub fn timeout(
+        sqe: *Sqe,
+        user_data: u64,
+        ts: *const linux.kernel_timespec,
+        count: u32,
+        flags: u32,
+    ) void {
+        sqe.prep_rw(.TIMEOUT, -1, @intFromPtr(ts), 1, count);
+        sqe.user_data = user_data;
+        sqe.rw_flags = flags;
+    }
+
+    pub fn timeoutRemove(sqe: *Sqe, user_data: u64, timeout_user_data: u64) void {
+        sqe.* = .{
+            .opcode = .TIMEOUT_REMOVE,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = 0,
+            .off = 0,
+            .addr = timeout_user_data,
+            .len = 0,
+            .rw_flags = 0,
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+
+    pub fn waitid(
+        sqe: *Sqe,
+        user_data: u64,
+        id_type: linux.P,
+        id: i32,
+        infop: *linux.siginfo_t,
+        options: u32,
+    ) void {
+        sqe.* = .{
+            .opcode = .WAITID,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = id,
+            .off = @intFromPtr(&infop),
+            .addr = 0,
+            .len = @backingInt(id_type),
+            .rw_flags = 0,
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = @bitCast(options),
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+
+    pub fn close(
+        sqe: *Sqe,
+        user_data: u64,
+        fd: linux.fd_t,
+    ) void {
+        sqe.* = .{
+            .opcode = .CLOSE,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = fd,
+            .off = 0,
+            .addr = 0,
+            .len = 0,
+            .rw_flags = 0,
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+
+    pub fn linkat(
+        sqe: *Sqe,
+        user_data: u64,
+        old_dir_fd: linux.fd_t,
+        old_path: [*:0]const u8,
+        new_dir_fd: linux.fd_t,
+        new_path: [*:0]const u8,
+        flags: u32,
+    ) void {
+        sqe.prep_rw(
+            .LINKAT,
+            old_dir_fd,
+            @intFromPtr(old_path),
+            0,
+            @intFromPtr(new_path),
+        );
+        sqe.len = @bitCast(new_dir_fd);
+        sqe.rw_flags = flags;
+
+        sqe.* = .{
+            .opcode = .LINKAT,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = old_dir_fd,
+            .off = @intFromPtr(new_path),
+            .addr = @intFromPtr(old_path),
+            .len = @bitCast(new_dir_fd),
+            .rw_flags = flags,
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+
+    pub fn symlinkat(
+        sqe: *Sqe,
+        user_data: u64,
+        target: [*:0]const u8,
+        new_dir_fd: linux.fd_t,
+        link_path: [*:0]const u8,
+    ) void {
+        sqe.* = .{
+            .opcode = .SYMLINKAT,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = new_dir_fd,
+            .off = @intFromPtr(link_path),
+            .addr = @intFromPtr(target),
+            .len = 0,
+            .rw_flags = 0,
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+
+    pub fn openat(
+        sqe: *Sqe,
+        user_data: u64,
+        fd: linux.fd_t,
+        path: [*:0]const u8,
+        flags: linux.O,
+        mode: linux.mode_t,
+    ) void {
+        sqe.* = .{
+            .opcode = .OPENAT,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = fd,
+            .off = 0,
+            .addr = @intFromPtr(path),
+            .len = mode,
+            .rw_flags = @bitCast(flags),
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+
+    pub fn unlinkat(
+        sqe: *Sqe,
+        user_data: u64,
+        dir_fd: linux.fd_t,
+        path: [*:0]const u8,
+        flags: u32,
+    ) void {
+        sqe.* = .{
+            .opcode = .UNLINKAT,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = dir_fd,
+            .off = 0,
+            .addr = @intFromPtr(path),
+            .len = 0,
+            .rw_flags = flags,
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+
+    pub fn fsync(
+        sqe: *Sqe,
+        user_data: u64,
+        fd: linux.fd_t,
+        flags: u32,
+    ) void {
+        sqe.* = .{
+            .opcode = .FSYNC,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = fd,
+            .off = 0,
+            .addr = 0,
+            .len = 0,
+            .rw_flags = flags,
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+
+    pub fn ftrucate(
+        sqe: *Sqe,
+        user_data: u64,
+        fd: linux.fd_t,
+        length: u64,
+        flags: u32,
+    ) void {
+        sqe.* = .{
+            .opcode = .FTRUNCATE,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = fd,
+            .off = length,
+            .addr = 0,
+            .len = 0,
+            .rw_flags = flags,
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+
+    pub fn renameat(
+        sqe: *Sqe,
+        user_data: u64,
+        old_dir_fd: linux.fd_t,
+        old_path: [*:0]const u8,
+        new_dir_fd: linux.fd_t,
+        new_path: [*:0]const u8,
+        flags: linux.RENAME,
+    ) void {
+        sqe.* = .{
+            .opcode = .RENAMEAT,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = old_dir_fd,
+            .off = @intFromPtr(new_path),
+            .addr = @intFromPtr(old_path),
+            .len = @bitCast(new_dir_fd),
+            .rw_flags = @bitCast(flags),
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+
+    pub fn futexWait(
+        sqe: *Sqe,
+        user_data: u64,
+        ptr: *const u32,
+        expected: u32,
+    ) void {
+        sqe.* = .{
+            .opcode = .FUTEX_WAIT,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true }),
+            .off = expected,
+            .addr = @intFromPtr(ptr),
+            .len = 0,
+            .rw_flags = 0,
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = std.math.maxInt(u32),
+            .resv = 0,
+        };
+    }
+
+    pub fn futexWake(
+        sqe: *Sqe,
+        user_data: u64,
+        ptr: *const u32,
+        max_waiters: u32,
+    ) void {
+        sqe.* = .{
+            .opcode = .FUTEX_WAKE,
+            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+            .ioprio = 0,
+            .fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true }),
+            .off = max_waiters,
+            .addr = @intFromPtr(ptr),
+            .len = 0,
+            .rw_flags = 0,
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = std.math.maxInt(u32),
+            .resv = 0,
+        };
+    }
+
+    pub fn mkdirat(
+        sqe: *Sqe,
+        user_data: u64,
+        dir_fd: linux.fd_t,
+        path: [*:0]const u8,
+        mode: linux.mode_t,
+    ) void {
+        sqe.prep_rw(.MKDIRAT, dir_fd, @intFromPtr(path), mode, 0);
+        sqe.* = .{
+            .opcode = .MKDIRAT,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = dir_fd,
+            .off = 0,
+            .addr = @intFromPtr(path),
+            .len = mode,
+            .rw_flags = 0,
+            .user_data = user_data,
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
     }
 
     pub const empty = .{

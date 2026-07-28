@@ -1455,42 +1455,16 @@ fn futexWait(
         },
     };
     const sqe, const fiber = try ev.enqueue();
-    sqe.* = .{
-        .opcode = .FUTEX_WAIT,
-        .flags = if (timespec) |_| linux.IOSQE_IO_LINK else 0,
-        .ioprio = 0,
-        .fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true }),
-        .off = expected,
-        .addr = @intFromPtr(ptr),
-        .len = 0,
-        .rw_flags = 0,
-        .user_data = @intFromPtr(fiber),
-        .buf_index = 0,
-        .personality = 0,
-        .splice_fd_in = 0,
-        .addr3 = std.math.maxInt(u32),
-        .resv = 0,
-    };
-    if (timespec) |*timespec_ptr| ev.getSqe().* = .{
-        .opcode = .LINK_TIMEOUT,
-        .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-        .ioprio = 0,
-        .fd = 0,
-        .off = 0,
-        .addr = @intFromPtr(timespec_ptr),
-        .len = 1,
-        .rw_flags = timeout_flags | @as(u32, switch (clock) {
+    sqe.futexWait(@intFromPtr(fiber), ptr, expected);
+    if (timespec) |*timespec_ptr| {
+        sqe.linkNext();
+        sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), timespec_ptr, timeout_flags | @as(u32, switch (clock) {
             .real => linux.IORING_TIMEOUT_REALTIME,
             else => 0,
             .boot => linux.IORING_TIMEOUT_BOOTTIME,
-        }),
-        .user_data = @backingInt(Completion.Userdata.wakeup),
-        .buf_index = 0,
-        .personality = 0,
-        .splice_fd_in = 0,
-        .addr3 = 0,
-        .resv = 0,
-    };
+        }));
+        sqe.skipSuccess();
+    }
     ev.yield(null, .nothing);
     switch (fiber.errno()) {
         .SUCCESS => {}, // notified by `wake()`
@@ -1506,22 +1480,7 @@ fn futexWait(
 fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const sqe, const fiber = ev.enqueueBlocked();
-    sqe.* = .{
-        .opcode = .FUTEX_WAIT,
-        .flags = 0,
-        .ioprio = 0,
-        .fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true }),
-        .off = expected,
-        .addr = @intFromPtr(ptr),
-        .len = 0,
-        .rw_flags = 0,
-        .user_data = @intFromPtr(fiber),
-        .buf_index = 0,
-        .personality = 0,
-        .splice_fd_in = 0,
-        .addr3 = std.math.maxInt(u32),
-        .resv = 0,
-    };
+    sqe.futexWait(@intFromPtr(fiber), ptr, expected);
     ev.yield(null, .nothing);
     switch (fiber.errno()) {
         .SUCCESS => {}, // notified by `wake()`
@@ -1535,22 +1494,9 @@ fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) 
 
 fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    ev.getSqe().* = .{
-        .opcode = .FUTEX_WAKE,
-        .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-        .ioprio = 0,
-        .fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true }),
-        .off = max_waiters,
-        .addr = @intFromPtr(ptr),
-        .len = 0,
-        .rw_flags = 0,
-        .user_data = @backingInt(Completion.Userdata.futex_wake),
-        .buf_index = 0,
-        .personality = 0,
-        .splice_fd_in = 0,
-        .addr3 = std.math.maxInt(u32),
-        .resv = 0,
-    };
+    const sqe = ev.getSqe();
+    sqe.futexWake(@backingInt(Completion.Userdata.futex_wake), ptr, max_waiters);
+    sqe.skipSuccess();
     ev.submit();
 }
 
@@ -1691,26 +1637,16 @@ fn batchAwaitConcurrent(
     };
     {
         // TODO: rethink cancelation
-        ev.getSqe().* = .{
-            .opcode = .TIMEOUT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = 0,
-            .off = 0,
-            .addr = @intFromPtr(&timespec),
-            .len = 1,
-            .rw_flags = timeout_flags | @as(u32, switch (clock) {
+        ev.getSqe().timeout(
+            @intFromPtr(&batch.userdata) | 0b11,
+            &timespec,
+            0,
+            timeout_flags | @as(u32, switch (clock) {
                 .real => linux.IORING_TIMEOUT_REALTIME,
                 else => 0,
                 .boot => linux.IORING_TIMEOUT_BOOTTIME,
             }),
-            .user_data = @intFromPtr(&batch.userdata) | 0b11,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        );
     }
     while (batch.completed.head == .none and batch.pending.head != .none) {
         ev.yield(null, .{ .batch_await = batch });
@@ -1720,22 +1656,7 @@ fn batchAwaitConcurrent(
         };
     }
     const sqe, const fiber = try ev.enqueue();
-    sqe.* = .{
-        .opcode = .TIMEOUT_REMOVE,
-        .flags = 0,
-        .ioprio = 0,
-        .fd = 0,
-        .off = 0,
-        .addr = @intFromPtr(&batch.userdata) | 0b11,
-        .len = 0,
-        .rw_flags = 0,
-        .user_data = @intFromPtr(fiber),
-        .buf_index = 0,
-        .personality = 0,
-        .splice_fd_in = 0,
-        .addr3 = 0,
-        .resv = 0,
-    };
+    sqe.timeoutRemove(@intFromPtr(fiber), @intFromPtr(&batch.userdata) | 0b11);
     ev.yield(null, .nothing);
     switch (fiber.errno()) {
         .SUCCESS => return,
@@ -1775,22 +1696,12 @@ fn batchDrainSubmitted(
                     .tag = .file_read_streaming,
                     .userdata = undefined,
                 } };
-                ev.getSqe().* = .{
-                    .opcode = .READ,
-                    .flags = 0,
-                    .ioprio = 0,
-                    .fd = fd,
-                    .off = std.math.maxInt(u64),
-                    .addr = @intFromPtr(buffer.ptr),
-                    .len = @min(buffer.len, 0xfffff000),
-                    .rw_flags = 0,
-                    .user_data = @intFromPtr(&storage.pending.userdata) | 0b10,
-                    .buf_index = 0,
-                    .personality = 0,
-                    .splice_fd_in = 0,
-                    .addr3 = 0,
-                    .resv = 0,
-                };
+                ev.getSqe().read(
+                    @intFromPtr(&storage.pending.userdata) | 0b10,
+                    fd,
+                    buffer,
+                    null,
+                );
                 break :result null;
             },
             .file_write_streaming => |o| {
@@ -1808,22 +1719,7 @@ fn batchDrainSubmitted(
                     .tag = .file_write_streaming,
                     .userdata = undefined,
                 } };
-                ev.getSqe().* = .{
-                    .opcode = .WRITE,
-                    .flags = 0,
-                    .ioprio = 0,
-                    .fd = fd,
-                    .off = std.math.maxInt(u64),
-                    .addr = @intFromPtr(buffer.ptr),
-                    .len = @min(buffer.len, 0xfffff000),
-                    .rw_flags = 0,
-                    .user_data = @intFromPtr(&storage.pending.userdata) | 0b10,
-                    .buf_index = 0,
-                    .personality = 0,
-                    .splice_fd_in = 0,
-                    .addr3 = 0,
-                    .resv = 0,
-                };
+                ev.getSqe().write(@intFromPtr(&storage.pending.userdata) | 0b10, fd, buffer, null);
                 break :result null;
             },
             .device_io_control => |o| if (concurrency)
@@ -1992,22 +1888,7 @@ fn dirCreateDir(
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .MKDIRAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir.handle,
-            .off = 0,
-            .addr = @intFromPtr(sub_path_posix.ptr),
-            .len = permissions.toMode(),
-            .rw_flags = 0,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.mkdirat(@intFromPtr(fiber), dir.handle, sub_path_posix, permissions.toMode());
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => return,
@@ -2564,22 +2445,7 @@ fn dirDeleteFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.Dele
 
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .UNLINKAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir.handle,
-            .off = 0,
-            .addr = @intFromPtr(sub_path_posix.ptr),
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.unlinkat(@intFromPtr(fiber), dir.handle, sub_path_posix, 0);
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => return,
@@ -2614,22 +2480,7 @@ fn dirDeleteDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.Delet
 
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .UNLINKAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir.handle,
-            .off = 0,
-            .addr = @intFromPtr(sub_path_posix.ptr),
-            .len = 0,
-            .rw_flags = linux.AT.REMOVEDIR,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.unlinkat(@intFromPtr(fiber), dir.handle, sub_path_posix, linux.AT.REMOVEDIR);
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => return,
@@ -2722,22 +2573,7 @@ fn dirSymLink(
 
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .SYMLINKAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir.handle,
-            .off = @intFromPtr(sym_link_path_posix.ptr),
-            .addr = @intFromPtr(target_path_posix.ptr),
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.symlinkat(@intFromPtr(fiber), target_path_posix.ptr, dir.handle, sym_link_path_posix.ptr);
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => return,
@@ -3031,22 +2867,7 @@ fn fileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .FSYNC,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = file.handle,
-            .off = 0,
-            .addr = 0,
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.fsync(@intFromPtr(fiber), file.handle, 0);
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => return,
@@ -3085,22 +2906,7 @@ fn fileSetLength(userdata: ?*anyopaque, file: File, length: u64) File.SetLengthE
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .FTRUNCATE,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = file.handle,
-            .off = length,
-            .addr = 0,
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.ftrucate(@intFromPtr(fiber), file.handle, length, 0);
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => return,
@@ -3925,23 +3731,13 @@ fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitErr
     var info: linux.siginfo_t = undefined;
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .WAITID,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = pid,
-            .off = @intFromPtr(&info),
-            .addr = 0,
-            .len = @backingInt(linux.P.PID),
-            .rw_flags = 0,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = linux.W.EXITED |
-                @as(i32, if (child.request_resource_usage_statistics) linux.W.NOWAIT else 0),
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.waitid(
+            @intFromPtr(fiber),
+            .PID,
+            pid,
+            &info,
+            linux.W.EXITED | @as(u32, if (child.request_resource_usage_statistics) linux.W.NOWAIT else 0),
+        );
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => {
@@ -3999,22 +3795,13 @@ fn childKill(userdata: ?*anyopaque, child: *process.Child) void {
     var info: linux.siginfo_t = undefined;
     while (true) {
         const sqe, const fiber = ev.enqueueBlocked();
-        sqe.* = .{
-            .opcode = .WAITID,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = pid,
-            .off = @intFromPtr(&info),
-            .addr = 0,
-            .len = @backingInt(linux.P.PID),
-            .rw_flags = 0,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = linux.W.EXITED,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.waitid(
+            @intFromPtr(fiber),
+            .PID,
+            pid,
+            &info,
+            linux.W.EXITED,
+        );
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => return,
@@ -4119,26 +3906,11 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
     };
 
     const sqe, const fiber = try ev.enqueue();
-    sqe.* = .{
-        .opcode = .TIMEOUT,
-        .flags = 0,
-        .ioprio = 0,
-        .fd = 0,
-        .off = 0,
-        .addr = @intFromPtr(&timespec),
-        .len = 1,
-        .rw_flags = timeout_flags | @as(u32, switch (clock) {
-            .real => linux.IORING_TIMEOUT_REALTIME,
-            else => 0,
-            .boot => linux.IORING_TIMEOUT_BOOTTIME,
-        }),
-        .user_data = @intFromPtr(fiber),
-        .buf_index = 0,
-        .personality = 0,
-        .splice_fd_in = 0,
-        .addr3 = 0,
-        .resv = 0,
-    };
+    sqe.timeout(@intFromPtr(fiber), &timespec, 0, timeout_flags | @as(u32, switch (clock) {
+        .real => linux.IORING_TIMEOUT_REALTIME,
+        else => 0,
+        .boot => linux.IORING_TIMEOUT_BOOTTIME,
+    }));
     ev.yield(null, .nothing);
     // Handles SUCCESS as well as clock not available and unexpected
     // errors. The user had a chance to check clock resolution before
@@ -4202,22 +3974,7 @@ fn netAccept(
         var storage: PosixAddress = undefined;
         var addr_len: linux.socklen_t = @sizeOf(PosixAddress);
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .ACCEPT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = listen_handle,
-            .off = @intFromPtr(&addr_len),
-            .addr = @intFromPtr(&storage),
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.accept(@intFromPtr(fiber), listen_handle, @ptrCast(&storage), &addr_len, 0);
         ev.yield(null, .nothing);
         const completion = fiber.completion();
         switch (completion.errno()) {
@@ -4373,25 +4130,10 @@ fn netReceive(
         };
 
         const sqe, const fiber = ev.enqueue() catch |err| return .{ err, message_i };
-        sqe.* = .{
-            .opcode = .RECVMSG,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = handle,
-            .off = 0,
-            .addr = @intFromPtr(&msg),
-            .len = 0,
-            .rw_flags = linux.MSG.NOSIGNAL |
-                @as(u32, if (flags.oob) linux.MSG.OOB else 0) |
-                @as(u32, if (flags.peek) linux.MSG.PEEK else 0) |
-                @as(u32, if (flags.trunc) linux.MSG.TRUNC else 0),
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.recvmsg(@intFromPtr(fiber), handle, &msg, linux.MSG.NOSIGNAL |
+            @as(u32, if (flags.oob) linux.MSG.OOB else 0) |
+            @as(u32, if (flags.peek) linux.MSG.PEEK else 0) |
+            @as(u32, if (flags.trunc) linux.MSG.TRUNC else 0));
         ev.yield(null, .nothing);
         const completion = fiber.completion();
         switch (completion.errno()) {
@@ -4510,26 +4252,11 @@ fn netShutdown(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .SHUTDOWN,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = handle,
-            .off = 0,
-            .addr = 0,
-            .len = switch (how) {
-                .recv => linux.SHUT.RD,
-                .send => linux.SHUT.WR,
-                .both => linux.SHUT.RDWR,
-            },
-            .rw_flags = 0,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.shutdown(@intFromPtr(fiber), handle, switch (how) {
+            .recv => linux.SHUT.RD,
+            .send => linux.SHUT.WR,
+            .both => linux.SHUT.RDWR,
+        });
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => return,
@@ -4583,22 +4310,7 @@ fn bind(
 ) !void {
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .BIND,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = socket_fd,
-            .off = addr_len,
-            .addr = @intFromPtr(addr),
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.bind(@intFromPtr(fiber), socket_fd, addr, addr_len);
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => return,
@@ -4625,39 +4337,14 @@ fn connect(
     timeout_flags: u32,
 ) !void {
     while (true) {
-        const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .CONNECT,
-            .flags = if (timeout) |_| linux.IOSQE_IO_LINK else 0,
-            .ioprio = 0,
-            .fd = fd,
-            .off = addr_len,
-            .addr = @intFromPtr(addr),
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        if (timeout) |*timespec_ptr| ev.getSqe().* = .{
-            .opcode = .LINK_TIMEOUT,
-            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-            .ioprio = 0,
-            .fd = 0,
-            .off = 0,
-            .addr = @intFromPtr(timespec_ptr),
-            .len = 1,
-            .rw_flags = timeout_flags,
-            .user_data = @backingInt(Completion.Userdata.wakeup),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        var sqe, const fiber = try ev.enqueue();
+        sqe.connect(@intFromPtr(fiber), fd, addr, addr_len);
+        if (timeout) |*timespec_ptr| {
+            sqe.linkNext();
+            sqe = ev.getSqe();
+            sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), timespec_ptr, timeout_flags);
+            sqe.skipSuccess();
+        }
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => return,
@@ -4708,22 +4395,7 @@ fn chdir(path: [*:0]const u8) ChdirError!void {
 
 fn close(ev: *Evented, fd: fd_t) void {
     const sqe, const fiber = ev.enqueueBlocked();
-    sqe.* = .{
-        .opcode = .CLOSE,
-        .flags = 0,
-        .ioprio = 0,
-        .fd = fd,
-        .off = 0,
-        .addr = 0,
-        .len = 0,
-        .rw_flags = 0,
-        .user_data = @intFromPtr(fiber),
-        .buf_index = 0,
-        .personality = 0,
-        .splice_fd_in = 0,
-        .addr3 = 0,
-        .resv = 0,
-    };
+    sqe.close(@intFromPtr(fiber), fd);
     ev.yield(null, .nothing);
     switch (fiber.errno()) {
         .BADF => recoverableOsBugDetected(), // Always a race condition.
@@ -4733,22 +4405,9 @@ fn close(ev: *Evented, fd: fd_t) void {
 }
 
 fn closeAsync(ev: *Evented, fd: fd_t) void {
-    ev.getSqe().* = .{
-        .opcode = .CLOSE,
-        .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-        .ioprio = 0,
-        .fd = fd,
-        .off = 0,
-        .addr = 0,
-        .len = 0,
-        .rw_flags = 0,
-        .user_data = @backingInt(Completion.Userdata.close),
-        .buf_index = 0,
-        .personality = 0,
-        .splice_fd_in = 0,
-        .addr3 = 0,
-        .resv = 0,
-    };
+    const sqe = ev.getSqe();
+    sqe.close(@backingInt(Completion.Userdata.close), fd);
+    sqe.skipSuccess();
 }
 
 fn fchmodat(
@@ -4916,22 +4575,7 @@ fn linkat(
     assert(flags & ~(@as(u32, linux.AT.SYMLINK_FOLLOW | linux.AT.EMPTY_PATH)) == 0);
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .LINKAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = old_dir,
-            .off = @intFromPtr(new_path),
-            .addr = @intFromPtr(old_path),
-            .len = @bitCast(new_dir),
-            .rw_flags = flags,
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.linkat(@intFromPtr(fiber), old_dir, old_path, new_dir, new_path, flags);
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => return,
@@ -4995,22 +4639,13 @@ fn openat(
     if (@hasField(linux.O, "LARGEFILE")) mut_flags.LARGEFILE = true;
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .OPENAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir,
-            .off = 0,
-            .addr = @intFromPtr(path),
-            .len = mode,
-            .rw_flags = @bitCast(mut_flags),
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.openat(
+            @intFromPtr(fiber),
+            dir,
+            path,
+            mut_flags,
+            mode,
+        );
         ev.yield(null, .nothing);
         const completion = fiber.completion();
         switch (completion.errno()) {
@@ -5171,22 +4806,7 @@ fn renameat(
 ) Dir.RenameError!void {
     while (true) {
         const sqe, const fiber = try ev.enqueue();
-        sqe.* = .{
-            .opcode = .RENAMEAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = old_dir,
-            .off = @intFromPtr(new_path),
-            .addr = @intFromPtr(old_path),
-            .len = @bitCast(new_dir),
-            .rw_flags = @bitCast(flags),
-            .user_data = @intFromPtr(fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        sqe.renameat(@intFromPtr(fiber), old_dir, old_path, new_dir, new_path, flags);
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
             .SUCCESS => return,

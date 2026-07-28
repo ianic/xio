@@ -195,9 +195,26 @@ test "some file operations" {
         try dir.createDirPath(io, "folder2/folder21");
         const dir2 = try dir.createDirPathOpen(io, "folder3/folder31", .{});
         defer dir2.close(io);
-        const stat = try dir2.stat(io);
+        var stat = try dir2.stat(io);
         try testing.expectEqual(.directory, stat.kind);
         try dir.rename("folder1", dir2, "folder32", io);
+
+        const file = try dir.createFile(io, "file2", .{});
+        defer file.close(io);
+        try dir.hardLink("file2", dir2, "link", io, .{});
+        try file.hardLink(io, dir2, "link2", .{});
+
+        try dir.symLink(io, "../../file2", "folder3/folder31/symlink", .{});
+        stat = try dir.statFile(io, "folder3/folder31/symlink", .{ .follow_symlinks = false });
+        try testing.expectEqual(.sym_link, stat.kind);
+        stat = try dir.statFile(io, "folder3/folder31/symlink", .{ .follow_symlinks = true });
+        try testing.expectEqual(.file, stat.kind);
+
+        const file3 = try dir.createFile(io, "file3", .{});
+        file3.close(io);
+        try dir.rename("file3", dir2, "file3_mv", io);
+        stat = try dir.statFile(io, "folder3/folder31/file3_mv", .{});
+        try testing.expectEqual(.file, stat.kind);
     }
     { // sync operations
         try testing.expectError(error.FileNotFound, dir.access(io, "folder1", .{}));
@@ -224,6 +241,7 @@ test "some file operations" {
         n = try file.writePositional(io, &.{ "line3\n", "line4\n" }, 7);
         try testing.expectEqual(12, n);
 
+        try file.setLength(io, 33 - 3);
         // var buf4: [1024]u8 = undefined;
         // n = try file.readPositional(io, &.{&buf4}, 0);
         // std.debug.print("{s}", .{buf4[0..n]});
@@ -233,8 +251,13 @@ test "some file operations" {
         defer file.close(io);
         const len = try file.length(io);
         const stat = try file.stat(io);
-        try testing.expectEqual(33, len);
+        try testing.expectEqual(30, len);
         try testing.expectEqual(len, stat.size);
+    }
+    {
+        try dir.deleteFile(io, "file1");
+        try dir.deleteFile(io, "file2");
+        try dir.deleteDir(io, "folder1");
     }
 }
 
