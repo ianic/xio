@@ -1497,7 +1497,6 @@ fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
     const sqe = ev.getSqe();
     sqe.futexWake(@backingInt(Completion.Userdata.futex_wake), ptr, max_waiters);
     sqe.flags.cqe_skip_success = true;
-
     ev.submit();
 }
 
@@ -4514,7 +4513,7 @@ fn getsockname(
     addr: *linux.sockaddr,
     addr_len: *linux.socklen_t,
 ) !void {
-    if (false and ev.op_getsockname_supported) {
+    if (ev.op_getsockname_supported) {
         if (ev.getsocknameAsync(socket_fd, addr, addr_len)) |_|
             // Async success
             return
@@ -4524,7 +4523,6 @@ fn getsockname(
             else => |e| return e,
         }
     }
-
     while (true) {
         try ev.enqueueSync();
         switch (linux.errno(linux.getsockname(socket_fd, addr, addr_len))) {
@@ -5107,9 +5105,9 @@ fn sendfile(
     };
     defer ev.destroyPipe(pipe);
 
-    var buffered: usize = 0;
-    var offset: usize = off_in;
-    var remaining: usize = count;
+    var buffered: u32 = 0;
+    var offset: u64 = off_in;
+    var remaining: u32 = @min(count, std.math.maxInt(u32));
     const no_offset: u64 = @bitCast(@as(i64, -1));
     while (remaining > 0) {
         if (buffered == 0) {
@@ -5132,8 +5130,8 @@ fn splice(
     off_in: u64,
     fd_out: fd_t,
     off_out: u64,
-    len: usize,
-) error{ SystemResources, Unexpected, Canceled }!usize {
+    len: u32,
+) error{ SystemResources, Unexpected, Canceled }!u32 {
     const splice_f_nonblock = 0x02;
     while (true) {
         const sqe, const fiber = try ev.enqueue();

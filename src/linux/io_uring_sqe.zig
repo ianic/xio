@@ -1,12 +1,8 @@
-//! Contains only the definition of `io_uring_sqe`.
-//! Split into its own file to compartmentalize the initialization methods.
-
 const std = @import("std");
 const linux = std.os.linux;
-const linuxx = @import("linuxx.zig");
 
 pub const Sqe = extern struct {
-    opcode: linux.IORING_OP = .NOP,
+    opcode: Op = .nop,
     flags: packed struct(u8) { // IOSQE_* flags
         fixed_file: bool = false,
         io_drain: bool = false,
@@ -18,12 +14,12 @@ pub const Sqe = extern struct {
         _: u1 = 0,
     } = .{},
     ioprio: u16 = 0,
-    fd: i32 = -1, // file descriptor to do IO on
+    fd: i32 = 0, // file descriptor to do IO on
     a: packed union(u64) {
         offset: u64, // offset into file
         addr2: u64,
         opt: packed struct {
-            cmd: linux.IO_URING_SOCKET_OP,
+            cmd: SocketOp,
             _: u32 = 0,
         },
     } = .{ .offset = 0 },
@@ -56,23 +52,6 @@ pub const Sqe = extern struct {
     } = .{ .addr3 = 0 },
     _: u64 = 0,
 
-    pub fn prep_rw(
-        sqe: *Sqe,
-        op: linux.IORING_OP,
-        fd: linux.fd_t,
-        addr: u64,
-        len: usize,
-        offset: u64,
-    ) void {
-        sqe.* = .{
-            .opcode = op,
-            .fd = fd,
-            .a = .{ .offset = offset },
-            .b = .{ .addr = addr },
-            .len = @intCast(len),
-        };
-    }
-
     pub fn splice(
         sqe: *Sqe,
         user_data: u64,
@@ -80,13 +59,19 @@ pub const Sqe = extern struct {
         off_in: u64,
         fd_out: linux.fd_t,
         off_out: u64,
-        len: usize,
+        len: u32,
         flags: u32,
     ) void {
-        sqe.prep_rw(.SPLICE, fd_out, off_in, len, off_out);
-        sqe.c = .{ .splice_fd_in = fd_in };
-        sqe.user_data = user_data;
-        sqe.op_flags = flags;
+        sqe.* = .{
+            .opcode = .splice,
+            .fd = fd_out,
+            .a = .{ .offset = off_out },
+            .b = .{ .splice_off_in = off_in },
+            .c = .{ .splice_fd_in = fd_in },
+            .len = len,
+            .user_data = user_data,
+            .op_flags = flags,
+        };
     }
 
     pub fn pipe(
@@ -95,22 +80,28 @@ pub const Sqe = extern struct {
         fds: *[2]linux.fd_t,
         flags: u32,
     ) void {
-        const OP_PIPE = 62;
-        sqe.prep_rw(@fromBackingInt(@intCast(OP_PIPE)), 0, @intFromPtr(fds), 0, 0);
-        sqe.user_data = user_data;
-        sqe.op_flags = flags;
+        sqe.* = .{
+            .opcode = .pipe,
+            .b = .{ .addr = @intFromPtr(fds) },
+            .user_data = user_data,
+            .op_flags = flags,
+        };
     }
 
     pub fn listen(
         sqe: *Sqe,
         user_data: u64,
         fd: linux.fd_t,
-        backlog: usize,
+        backlog: u32,
         flags: u32,
     ) void {
-        sqe.prep_rw(.LISTEN, fd, 0, backlog, 0);
-        sqe.user_data = user_data;
-        sqe.op_flags = flags;
+        sqe.* = .{
+            .opcode = .listen,
+            .fd = fd,
+            .len = backlog,
+            .user_data = user_data,
+            .op_flags = flags,
+        };
     }
 
     pub fn statx(
@@ -122,9 +113,15 @@ pub const Sqe = extern struct {
         buf: *linux.Statx,
         flags: u32,
     ) void {
-        sqe.prep_rw(.STATX, fd, @intFromPtr(path), @as(u32, @bitCast(mask)), @intFromPtr(buf));
-        sqe.user_data = user_data;
-        sqe.op_flags = flags;
+        sqe.* = .{
+            .opcode = .statx,
+            .fd = fd,
+            .b = .{ .addr = @intFromPtr(path) },
+            .len = @as(u32, @bitCast(mask)),
+            .a = .{ .offset = @intFromPtr(buf) },
+            .user_data = user_data,
+            .op_flags = flags,
+        };
     }
 
     pub fn sendmsg(
@@ -134,9 +131,14 @@ pub const Sqe = extern struct {
         msg: *const linux.msghdr_const,
         flags: u32,
     ) void {
-        sqe.prep_rw(.SENDMSG, fd, @intFromPtr(msg), 1, 0);
-        sqe.user_data = user_data;
-        sqe.op_flags = flags;
+        sqe.* = .{
+            .opcode = .sendmsg,
+            .fd = fd,
+            .b = .{ .addr = @intFromPtr(msg) },
+            .len = 1,
+            .user_data = user_data,
+            .op_flags = flags,
+        };
     }
 
     pub fn send(
@@ -146,9 +148,14 @@ pub const Sqe = extern struct {
         buffer: []const u8,
         flags: u32,
     ) void {
-        sqe.prep_rw(.SEND, fd, @intFromPtr(buffer.ptr), buffer.len, 0);
-        sqe.user_data = user_data;
-        sqe.op_flags = flags;
+        sqe.* = .{
+            .opcode = .send,
+            .fd = fd,
+            .b = .{ .addr = @intFromPtr(buffer.ptr) },
+            .len = @intCast(buffer.len),
+            .user_data = user_data,
+            .op_flags = flags,
+        };
     }
 
     pub fn socket(
@@ -159,9 +166,14 @@ pub const Sqe = extern struct {
         protocol: u32,
         flags: u32,
     ) void {
-        sqe.prep_rw(.SOCKET, @intCast(domain), 0, protocol, socket_type);
-        sqe.user_data = user_data;
-        sqe.op_flags = flags;
+        sqe.* = .{
+            .opcode = .socket,
+            .fd = @intCast(domain),
+            .len = protocol,
+            .a = .{ .offset = socket_type },
+            .user_data = user_data,
+            .op_flags = flags,
+        };
     }
 
     pub fn setsockopt(
@@ -173,12 +185,15 @@ pub const Sqe = extern struct {
         optval: u64,
         optlen: u32,
     ) void {
-        sqe.prep_rw(.URING_CMD, fd, 0, 0, 0);
-        sqe.user_data = user_data;
-        sqe.a = .{ .opt = .{ .cmd = .SETSOCKOPT } };
-        sqe.b = .{ .opt = .{ .level = level, .name = opt_name } };
-        sqe.c = .{ .optlen = optlen };
-        sqe.d = .{ .optval = optval };
+        sqe.* = .{
+            .opcode = .uring_cmd,
+            .fd = fd,
+            .a = .{ .opt = .{ .cmd = .setsockopt } },
+            .b = .{ .opt = .{ .level = level, .name = opt_name } },
+            .c = .{ .optlen = optlen },
+            .d = .{ .optval = optval },
+            .user_data = user_data,
+        };
     }
 
     pub fn getsockname(
@@ -188,12 +203,15 @@ pub const Sqe = extern struct {
         addr: *linux.sockaddr,
         addr_len: *linux.socklen_t,
     ) void {
-        sqe.prep_rw(.URING_CMD, fd, 0, 0, 0);
-        sqe.user_data = user_data;
-        sqe.a = .{ .opt = .{ .cmd = .GETSOCKNAME } };
-        sqe.b = .{ .addr = @intFromPtr(addr) };
-        sqe.c = .{ .optlen = 0 }; // optlen: 0 - local, 1 - peer
-        sqe.d = .{ .addr3 = @intFromPtr(addr_len) };
+        sqe.* = .{
+            .opcode = .uring_cmd,
+            .fd = fd,
+            .a = .{ .opt = .{ .cmd = .getsockname } },
+            .b = .{ .addr = @intFromPtr(addr) },
+            .c = .{ .optlen = 0 }, // optlen: 0 - local, 1 - peer
+            .d = .{ .addr3 = @intFromPtr(addr_len) },
+            .user_data = user_data,
+        };
     }
 
     pub fn asyncCancel(
@@ -201,14 +219,18 @@ pub const Sqe = extern struct {
         user_data: u64,
         cancel_user_data: u64,
     ) void {
-        sqe.prep_rw(.ASYNC_CANCEL, -1, cancel_user_data, 0, 0);
-        sqe.user_data = user_data;
-        sqe.flags.cqe_skip_success = true;
+        sqe.* = .{
+            .opcode = .async_cancel,
+            .fd = -1,
+            .b = .{ .addr = cancel_user_data },
+            .user_data = user_data,
+            .flags = .{ .cqe_skip_success = true },
+        };
     }
 
     pub fn nop(sqe: *Sqe, user_data: u64) void {
         sqe.* = .{
-            .opcode = .NOP,
+            .opcode = .nop,
             .user_data = user_data,
         };
     }
@@ -220,9 +242,14 @@ pub const Sqe = extern struct {
         buffer: []u8,
         offset: ?u64,
     ) void {
-        const off = offset orelse std.math.maxInt(u64);
-        sqe.prep_rw(.READ, fd, @intFromPtr(buffer.ptr), @min(buffer.len, 0xfffff000), off);
-        sqe.user_data = user_data;
+        sqe.* = .{
+            .opcode = .read,
+            .fd = fd,
+            .b = .{ .addr = @intFromPtr(buffer.ptr) },
+            .len = @min(buffer.len, 0xfffff000),
+            .a = .{ .offset = offset orelse no_offset },
+            .user_data = user_data,
+        };
     }
 
     pub fn readv(
@@ -232,9 +259,14 @@ pub const Sqe = extern struct {
         iovecs: []const std.posix.iovec,
         offset: ?u64,
     ) void {
-        const off = offset orelse std.math.maxInt(u64);
-        sqe.prep_rw(.READV, fd, @intFromPtr(iovecs.ptr), iovecs.len, off);
-        sqe.user_data = user_data;
+        sqe.* = .{
+            .opcode = .readv,
+            .fd = fd,
+            .b = .{ .addr = @intFromPtr(iovecs.ptr) },
+            .len = @intCast(iovecs.len),
+            .a = .{ .offset = offset orelse no_offset },
+            .user_data = user_data,
+        };
     }
 
     pub fn write(
@@ -244,9 +276,14 @@ pub const Sqe = extern struct {
         buffer: []const u8,
         offset: ?u64,
     ) void {
-        const off = offset orelse std.math.maxInt(u64);
-        sqe.prep_rw(.WRITE, fd, @intFromPtr(buffer.ptr), buffer.len, off);
-        sqe.user_data = user_data;
+        sqe.* = .{
+            .opcode = .write,
+            .fd = fd,
+            .b = .{ .addr = @intFromPtr(buffer.ptr) },
+            .len = @intCast(buffer.len),
+            .a = .{ .offset = offset orelse no_offset },
+            .user_data = user_data,
+        };
     }
 
     pub fn writev(
@@ -256,9 +293,14 @@ pub const Sqe = extern struct {
         iovecs: []const std.posix.iovec_const,
         offset: ?u64,
     ) void {
-        const off = offset orelse std.math.maxInt(u64);
-        sqe.prep_rw(.WRITEV, fd, @intFromPtr(iovecs.ptr), iovecs.len, off);
-        sqe.user_data = user_data;
+        sqe.* = .{
+            .opcode = .writev,
+            .fd = fd,
+            .b = .{ .addr = @intFromPtr(iovecs.ptr) },
+            .len = @intCast(iovecs.len),
+            .a = .{ .offset = offset orelse no_offset },
+            .user_data = user_data,
+        };
     }
 
     pub fn connect(
@@ -268,8 +310,13 @@ pub const Sqe = extern struct {
         addr: *const linux.sockaddr,
         addr_len: linux.socklen_t,
     ) void {
-        sqe.prep_rw(.CONNECT, fd, @intFromPtr(addr), 0, addr_len);
-        sqe.user_data = user_data;
+        sqe.* = .{
+            .opcode = .connect,
+            .fd = fd,
+            .b = .{ .addr = @intFromPtr(addr) },
+            .a = .{ .offset = addr_len },
+            .user_data = user_data,
+        };
     }
 
     pub fn bind(
@@ -279,8 +326,13 @@ pub const Sqe = extern struct {
         addr: *const linux.sockaddr,
         addrlen: linux.socklen_t,
     ) void {
-        sqe.prep_rw(.BIND, fd, @intFromPtr(addr), 0, addrlen);
-        sqe.user_data = user_data;
+        sqe.* = .{
+            .opcode = .bind,
+            .fd = fd,
+            .b = .{ .addr = @intFromPtr(addr) },
+            .a = .{ .offset = addrlen },
+            .user_data = user_data,
+        };
     }
 
     pub fn linkTimeout(
@@ -289,9 +341,14 @@ pub const Sqe = extern struct {
         ts: *const linux.kernel_timespec,
         flags: u32,
     ) void {
-        sqe.prep_rw(.LINK_TIMEOUT, -1, @intFromPtr(ts), 1, 0);
-        sqe.op_flags = flags;
-        sqe.user_data = user_data;
+        sqe.* = .{
+            .opcode = .link_timeout,
+            .fd = -1,
+            .b = .{ .addr = @intFromPtr(ts) },
+            .len = 1,
+            .op_flags = flags,
+            .user_data = user_data,
+        };
     }
 
     pub fn shutdown(
@@ -300,8 +357,12 @@ pub const Sqe = extern struct {
         sockfd: linux.socket_t,
         how: u32,
     ) void {
-        sqe.prep_rw(.SHUTDOWN, sockfd, 0, how, 0);
-        sqe.user_data = user_data;
+        sqe.* = .{
+            .opcode = .shutdown,
+            .fd = sockfd,
+            .len = how,
+            .user_data = user_data,
+        };
     }
 
     pub fn recvmsg(
@@ -311,9 +372,14 @@ pub const Sqe = extern struct {
         msg: *linux.msghdr,
         flags: u32,
     ) void {
-        sqe.prep_rw(.RECVMSG, fd, @intFromPtr(msg), 1, 0);
-        sqe.user_data = user_data;
-        sqe.op_flags = flags;
+        sqe.* = .{
+            .opcode = .recvmsg,
+            .fd = fd,
+            .b = .{ .addr = @intFromPtr(msg) },
+            .len = 1,
+            .user_data = user_data,
+            .op_flags = flags,
+        };
     }
 
     pub fn accept(
@@ -324,9 +390,14 @@ pub const Sqe = extern struct {
         addrlen: ?*linux.socklen_t,
         flags: u32,
     ) void {
-        sqe.prep_rw(.ACCEPT, fd, @intFromPtr(addr), 0, @intFromPtr(addrlen));
-        sqe.user_data = user_data;
-        sqe.op_flags = flags;
+        sqe.* = .{
+            .opcode = .accept,
+            .fd = fd,
+            .a = .{ .addr2 = @intFromPtr(addrlen) },
+            .b = .{ .addr = @intFromPtr(addr) },
+            .user_data = user_data,
+            .op_flags = flags,
+        };
     }
 
     pub fn timeout(
@@ -336,14 +407,20 @@ pub const Sqe = extern struct {
         count: u32,
         flags: u32,
     ) void {
-        sqe.prep_rw(.TIMEOUT, -1, @intFromPtr(ts), 1, count);
-        sqe.user_data = user_data;
-        sqe.op_flags = flags;
+        sqe.* = .{
+            .opcode = .timeout,
+            .fd = -1,
+            .a = .{ .offset = count },
+            .b = .{ .addr = @intFromPtr(ts) },
+            .len = 1,
+            .user_data = user_data,
+            .op_flags = flags,
+        };
     }
 
     pub fn timeoutRemove(sqe: *Sqe, user_data: u64, timeout_user_data: u64) void {
         sqe.* = .{
-            .opcode = .TIMEOUT_REMOVE,
+            .opcode = .timeout_remove,
             .b = .{ .addr = timeout_user_data },
             .user_data = user_data,
         };
@@ -358,12 +435,12 @@ pub const Sqe = extern struct {
         options: u32,
     ) void {
         sqe.* = .{
-            .opcode = .WAITID,
+            .opcode = .waitid,
             .fd = id,
             .a = .{ .addr2 = @intFromPtr(&infop) },
+            .c = .{ .optlen = options },
             .len = @backingInt(id_type),
             .user_data = user_data,
-            .c = .{ .optlen = options },
         };
     }
 
@@ -373,7 +450,7 @@ pub const Sqe = extern struct {
         fd: linux.fd_t,
     ) void {
         sqe.* = .{
-            .opcode = .CLOSE,
+            .opcode = .close,
             .fd = fd,
             .user_data = user_data,
         };
@@ -388,18 +465,8 @@ pub const Sqe = extern struct {
         new_path: [*:0]const u8,
         flags: u32,
     ) void {
-        sqe.prep_rw(
-            .LINKAT,
-            old_dir_fd,
-            @intFromPtr(old_path),
-            0,
-            @intFromPtr(new_path),
-        );
-        sqe.len = @bitCast(new_dir_fd);
-        sqe.op_flags = flags;
-
         sqe.* = .{
-            .opcode = .LINKAT,
+            .opcode = .linkat,
             .fd = old_dir_fd,
             .a = .{ .addr2 = @intFromPtr(new_path) },
             .b = .{ .addr = @intFromPtr(old_path) },
@@ -417,7 +484,7 @@ pub const Sqe = extern struct {
         link_path: [*:0]const u8,
     ) void {
         sqe.* = .{
-            .opcode = .SYMLINKAT,
+            .opcode = .symlinkat,
             .fd = new_dir_fd,
             .a = .{ .addr2 = @intFromPtr(link_path) },
             .b = .{ .addr = @intFromPtr(target) },
@@ -434,7 +501,7 @@ pub const Sqe = extern struct {
         mode: linux.mode_t,
     ) void {
         sqe.* = .{
-            .opcode = .OPENAT,
+            .opcode = .openat,
             .fd = fd,
             .b = .{ .addr = @intFromPtr(path) },
             .len = mode,
@@ -451,7 +518,7 @@ pub const Sqe = extern struct {
         flags: u32,
     ) void {
         sqe.* = .{
-            .opcode = .UNLINKAT,
+            .opcode = .unlinkat,
             .fd = dir_fd,
             .b = .{ .addr = @intFromPtr(path) },
             .op_flags = flags,
@@ -466,7 +533,7 @@ pub const Sqe = extern struct {
         flags: u32,
     ) void {
         sqe.* = .{
-            .opcode = .FSYNC,
+            .opcode = .fsync,
             .fd = fd,
             .op_flags = flags,
             .user_data = user_data,
@@ -481,7 +548,7 @@ pub const Sqe = extern struct {
         flags: u32,
     ) void {
         sqe.* = .{
-            .opcode = .FTRUNCATE,
+            .opcode = .ftruncate,
             .fd = fd,
             .a = .{ .offset = length },
             .op_flags = flags,
@@ -499,7 +566,7 @@ pub const Sqe = extern struct {
         flags: linux.RENAME,
     ) void {
         sqe.* = .{
-            .opcode = .RENAMEAT,
+            .opcode = .renameat,
             .fd = old_dir_fd,
             .a = .{ .addr2 = @intFromPtr(new_path) },
             .b = .{ .addr = @intFromPtr(old_path) },
@@ -516,12 +583,12 @@ pub const Sqe = extern struct {
         expected: u32,
     ) void {
         sqe.* = .{
-            .opcode = .FUTEX_WAIT,
+            .opcode = .futex_wait,
             .fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true }),
             .a = .{ .offset = expected },
             .b = .{ .addr = @intFromPtr(ptr) },
-            .user_data = user_data,
             .d = .{ .addr3 = std.math.maxInt(u32) },
+            .user_data = user_data,
         };
     }
 
@@ -532,13 +599,13 @@ pub const Sqe = extern struct {
         max_waiters: u32,
     ) void {
         sqe.* = .{
-            .opcode = .FUTEX_WAKE,
+            .opcode = .futex_wake,
             .flags = .{ .cqe_skip_success = true },
             .fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true }),
             .a = .{ .offset = max_waiters },
             .b = .{ .addr = @intFromPtr(ptr) },
-            .user_data = user_data,
             .d = .{ .addr3 = std.math.maxInt(u32) },
+            .user_data = user_data,
         };
     }
 
@@ -550,7 +617,7 @@ pub const Sqe = extern struct {
         mode: linux.mode_t,
     ) void {
         sqe.* = .{
-            .opcode = .MKDIRAT,
+            .opcode = .mkdirat,
             .fd = dir_fd,
             .b = .{ .addr = @intFromPtr(path) },
             .len = mode,
@@ -558,3 +625,83 @@ pub const Sqe = extern struct {
         };
     }
 };
+
+const SocketOp = enum(u32) {
+    siocin = 0,
+    siocoutq = 1,
+    getsockopt = 2,
+    setsockopt = 3,
+    tx_timestamp = 4,
+    getsockname = 5,
+};
+
+const Op = enum(u8) {
+    nop,
+    readv,
+    writev,
+    fsync,
+    read_fixed,
+    write_fixed,
+    poll_add,
+    poll_remove,
+    sync_file_range,
+    sendmsg,
+    recvmsg,
+    timeout,
+    timeout_remove,
+    accept,
+    async_cancel,
+    link_timeout,
+    connect,
+    fallocate,
+    openat,
+    close,
+    files_update,
+    statx,
+    read,
+    write,
+    fadvise,
+    madvise,
+    send,
+    recv,
+    openat2,
+    epoll_ctl,
+    splice,
+    provide_buffers,
+    remove_buffers,
+    tee,
+    shutdown,
+    renameat,
+    unlinkat,
+    mkdirat,
+    symlinkat,
+    linkat,
+    msg_ring,
+    fsetxattr,
+    setxattr,
+    fgetxattr,
+    getxattr,
+    socket,
+    uring_cmd,
+    send_zc,
+    sendmsg_zc,
+    read_multishot,
+    waitid,
+    futex_wait,
+    futex_wake,
+    futex_waitv,
+    fixed_fd_install,
+    ftruncate,
+    bind,
+    listen,
+    recv_zc,
+    epoll_wait,
+    readv_fixed,
+    writev_fixed,
+    pipe,
+    nop128,
+    uring_cmd128,
+    _,
+};
+
+const no_offset = std.math.maxInt(u64);
