@@ -1457,13 +1457,13 @@ fn futexWait(
     const sqe, const fiber = try ev.enqueue();
     sqe.futexWait(@intFromPtr(fiber), ptr, expected);
     if (timespec) |*timespec_ptr| {
-        sqe.linkNext();
+        sqe.flags.io_link = true;
         sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), timespec_ptr, timeout_flags | @as(u32, switch (clock) {
             .real => linux.IORING_TIMEOUT_REALTIME,
             else => 0,
             .boot => linux.IORING_TIMEOUT_BOOTTIME,
         }));
-        sqe.skipSuccess();
+        sqe.flags.cqe_skip_success = true;
     }
     ev.yield(null, .nothing);
     switch (fiber.errno()) {
@@ -1496,7 +1496,8 @@ fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const sqe = ev.getSqe();
     sqe.futexWake(@backingInt(Completion.Userdata.futex_wake), ptr, max_waiters);
-    sqe.skipSuccess();
+    sqe.flags.cqe_skip_success = true;
+
     ev.submit();
 }
 
@@ -4340,10 +4341,10 @@ fn connect(
         var sqe, const fiber = try ev.enqueue();
         sqe.connect(@intFromPtr(fiber), fd, addr, addr_len);
         if (timeout) |*timespec_ptr| {
-            sqe.linkNext();
+            sqe.flags.io_link = true;
             sqe = ev.getSqe();
             sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), timespec_ptr, timeout_flags);
-            sqe.skipSuccess();
+            sqe.flags.cqe_skip_success = true;
         }
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
@@ -4407,7 +4408,7 @@ fn close(ev: *Evented, fd: fd_t) void {
 fn closeAsync(ev: *Evented, fd: fd_t) void {
     const sqe = ev.getSqe();
     sqe.close(@backingInt(Completion.Userdata.close), fd);
-    sqe.skipSuccess();
+    sqe.flags.cqe_skip_success = true;
 }
 
 fn fchmodat(
@@ -4839,7 +4840,7 @@ fn renameat(
 fn setsockopt(
     ev: *Evented,
     fd: fd_t,
-    level: i32,
+    level: u32,
     opt_name: u32,
     option: u32,
 ) !void {

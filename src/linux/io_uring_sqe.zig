@@ -6,58 +6,55 @@ const linux = std.os.linux;
 const linuxx = @import("linuxx.zig");
 
 pub const Sqe = extern struct {
-    opcode: linux.IORING_OP,
-    flags: u8,
-    ioprio: u16,
-    fd: i32,
-    off: u64,
-    addr: u64,
-    len: u32,
-    rw_flags: u32,
-    user_data: u64,
-    buf_index: u16,
-    personality: u16,
-    splice_fd_in: i32,
-    addr3: u64,
-    resv: u64,
-
-    pub fn prep_nop(sqe: *Sqe) void {
-        sqe.* = .{
-            .opcode = .NOP,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = 0,
-            .off = 0,
-            .addr = 0,
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = 0,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-    }
-
-    pub fn prep_fsync(sqe: *Sqe, fd: linux.fd_t, flags: u32) void {
-        sqe.* = .{
-            .opcode = .FSYNC,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = fd,
-            .off = 0,
-            .addr = 0,
-            .len = 0,
-            .rw_flags = flags,
-            .user_data = 0,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-    }
+    opcode: linux.IORING_OP = .NOP,
+    flags: packed struct(u8) { // IOSQE_* flags
+        fixed_file: bool = false,
+        io_drain: bool = false,
+        io_link: bool = false,
+        io_hardlink: bool = false,
+        async: bool = false,
+        buffer_select: bool = false,
+        cqe_skip_success: bool = false,
+        _: u1 = 0,
+    } = .{},
+    ioprio: u16 = 0,
+    fd: i32 = -1, // file descriptor to do IO on
+    a: packed union(u64) {
+        offset: u64, // offset into file
+        addr2: u64,
+        opt: packed struct {
+            cmd: linux.IO_URING_SOCKET_OP,
+            _: u32 = 0,
+        },
+    } = .{ .offset = 0 },
+    b: packed union(u64) {
+        addr: u64, // pointer to buffer or iovecs
+        splice_off_in: u64,
+        opt: packed struct {
+            level: u32,
+            name: u32,
+        },
+    } = .{ .addr = 0 },
+    len: u32 = 0, // buffer size or number of iovecs
+    op_flags: u32 = 0, // operation flags
+    user_data: u64 = 0, // data to be passed back at completion time
+    buf_group: u16 = 0,
+    personality: u16 = 0,
+    c: packed union(u32) {
+        splice_fd_in: i32,
+        file_index: u32,
+        zcrx_ifq_idx: u32,
+        optlen: u32,
+        addr: packed struct {
+            len: u16,
+            _: u16 = 0,
+        },
+    } = .{ .splice_fd_in = 0 },
+    d: packed union(u64) {
+        addr3: u64,
+        optval: u64,
+    } = .{ .addr3 = 0 },
+    _: u64 = 0,
 
     pub fn prep_rw(
         sqe: *Sqe,
@@ -69,625 +66,11 @@ pub const Sqe = extern struct {
     ) void {
         sqe.* = .{
             .opcode = op,
-            .flags = 0,
-            .ioprio = 0,
             .fd = fd,
-            .off = offset,
-            .addr = addr,
+            .a = .{ .offset = offset },
+            .b = .{ .addr = addr },
             .len = @intCast(len),
-            .rw_flags = 0,
-            .user_data = 0,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
         };
-    }
-
-    pub fn prep_read(sqe: *Sqe, fd: linux.fd_t, buffer: []u8, offset: u64) void {
-        sqe.prep_rw(.READ, fd, @intFromPtr(buffer.ptr), buffer.len, offset);
-    }
-
-    pub fn prep_write(sqe: *Sqe, fd: linux.fd_t, buffer: []const u8, offset: u64) void {
-        sqe.prep_rw(.WRITE, fd, @intFromPtr(buffer.ptr), buffer.len, offset);
-    }
-
-    pub fn prep_splice(sqe: *Sqe, fd_in: linux.fd_t, off_in: u64, fd_out: linux.fd_t, off_out: u64, len: usize) void {
-        sqe.prep_rw(.SPLICE, fd_out, undefined, len, off_out);
-        sqe.addr = off_in;
-        sqe.splice_fd_in = fd_in;
-    }
-
-    pub fn prep_readv(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        iovecs: []const std.posix.iovec,
-        offset: u64,
-    ) void {
-        sqe.prep_rw(.READV, fd, @intFromPtr(iovecs.ptr), iovecs.len, offset);
-    }
-
-    pub fn prep_writev(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        iovecs: []const std.posix.iovec_const,
-        offset: u64,
-    ) void {
-        sqe.prep_rw(.WRITEV, fd, @intFromPtr(iovecs.ptr), iovecs.len, offset);
-    }
-
-    pub fn prep_read_fixed(sqe: *Sqe, fd: linux.fd_t, buffer: *std.posix.iovec, offset: u64, buffer_index: u16) void {
-        sqe.prep_rw(.READ_FIXED, fd, @intFromPtr(buffer.base), buffer.len, offset);
-        sqe.buf_index = buffer_index;
-    }
-
-    pub fn prep_write_fixed(sqe: *Sqe, fd: linux.fd_t, buffer: *std.posix.iovec, offset: u64, buffer_index: u16) void {
-        sqe.prep_rw(.WRITE_FIXED, fd, @intFromPtr(buffer.base), buffer.len, offset);
-        sqe.buf_index = buffer_index;
-    }
-
-    pub fn prep_accept(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        addr: ?*linux.sockaddr,
-        addrlen: ?*linux.socklen_t,
-        flags: u32,
-    ) void {
-        // `addr` holds a pointer to `sockaddr`, and `addr2` holds a pointer to socklen_t`.
-        // `addr2` maps to `sqe.off` (u64) instead of `sqe.len` (which is only a u32).
-        sqe.prep_rw(.ACCEPT, fd, @intFromPtr(addr), 0, @intFromPtr(addrlen));
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_accept_direct(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        addr: ?*linux.sockaddr,
-        addrlen: ?*linux.socklen_t,
-        flags: u32,
-        file_index: u32,
-    ) void {
-        prep_accept(sqe, fd, addr, addrlen, flags);
-        __io_uring_set_target_fixed_file(sqe, file_index);
-    }
-
-    pub fn prep_multishot_accept_direct(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        addr: ?*linux.sockaddr,
-        addrlen: ?*linux.socklen_t,
-        flags: u32,
-    ) void {
-        prep_multishot_accept(sqe, fd, addr, addrlen, flags);
-        __io_uring_set_target_fixed_file(sqe, linux.IORING_FILE_INDEX_ALLOC);
-    }
-
-    fn __io_uring_set_target_fixed_file(sqe: *Sqe, file_index: u32) void {
-        const sqe_file_index: u32 = if (file_index == linux.IORING_FILE_INDEX_ALLOC)
-            linux.IORING_FILE_INDEX_ALLOC
-        else
-            // 0 means no fixed files, indexes should be encoded as "index + 1"
-            file_index + 1;
-        // This filed is overloaded in liburing:
-        //   splice_fd_in: i32
-        //   sqe_file_index: u32
-        sqe.splice_fd_in = @bitCast(sqe_file_index);
-    }
-
-    pub fn prep_connect(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        addr: *const linux.sockaddr,
-        addrlen: linux.socklen_t,
-    ) void {
-        // `addrlen` maps to `sqe.off` (u64) instead of `sqe.len` (which is only a u32).
-        sqe.prep_rw(.CONNECT, fd, @intFromPtr(addr), 0, addrlen);
-    }
-
-    pub fn prep_epoll_ctl(
-        sqe: *Sqe,
-        epfd: linux.fd_t,
-        fd: linux.fd_t,
-        op: u32,
-        ev: ?*linux.epoll_event,
-    ) void {
-        sqe.prep_rw(.EPOLL_CTL, epfd, @intFromPtr(ev), op, @intCast(fd));
-    }
-
-    pub fn prep_recv(sqe: *Sqe, fd: linux.fd_t, buffer: []u8, flags: u32) void {
-        sqe.prep_rw(.RECV, fd, @intFromPtr(buffer.ptr), buffer.len, 0);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_recv_multishot(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        buffer: []u8,
-        flags: u32,
-    ) void {
-        sqe.prep_recv(fd, buffer, flags);
-        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
-    }
-
-    pub fn prep_recvmsg(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        msg: *linux.msghdr,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.RECVMSG, fd, @intFromPtr(msg), 1, 0);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_recvmsg_multishot(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        msg: *linux.msghdr,
-        flags: u32,
-    ) void {
-        sqe.prep_recvmsg(fd, msg, flags);
-        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
-    }
-
-    pub fn prep_send(sqe: *Sqe, fd: linux.fd_t, buffer: []const u8, flags: u32) void {
-        sqe.prep_rw(.SEND, fd, @intFromPtr(buffer.ptr), buffer.len, 0);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_send_zc(sqe: *Sqe, fd: linux.fd_t, buffer: []const u8, flags: u32, zc_flags: u16) void {
-        sqe.prep_rw(.SEND_ZC, fd, @intFromPtr(buffer.ptr), buffer.len, 0);
-        sqe.rw_flags = flags;
-        sqe.ioprio = zc_flags;
-    }
-
-    pub fn prep_send_zc_fixed(sqe: *Sqe, fd: linux.fd_t, buffer: []const u8, flags: u32, zc_flags: u16, buf_index: u16) void {
-        prep_send_zc(sqe, fd, buffer, flags, zc_flags);
-        sqe.ioprio |= linux.IORING_RECVSEND_FIXED_BUF;
-        sqe.buf_index = buf_index;
-    }
-
-    pub fn prep_sendmsg_zc(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        msg: *const linux.msghdr_const,
-        flags: u32,
-    ) void {
-        prep_sendmsg(sqe, fd, msg, flags);
-        sqe.opcode = .SENDMSG_ZC;
-    }
-
-    pub fn prep_sendmsg(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        msg: *const linux.msghdr_const,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.SENDMSG, fd, @intFromPtr(msg), 1, 0);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_openat(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        path: [*:0]const u8,
-        flags: linux.O,
-        mode: linux.mode_t,
-    ) void {
-        sqe.prep_rw(.OPENAT, fd, @intFromPtr(path), mode, 0);
-        sqe.rw_flags = @bitCast(flags);
-    }
-
-    pub fn prep_openat_direct(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        path: [*:0]const u8,
-        flags: linux.O,
-        mode: linux.mode_t,
-        file_index: u32,
-    ) void {
-        prep_openat(sqe, fd, path, flags, mode);
-        __io_uring_set_target_fixed_file(sqe, file_index);
-    }
-
-    pub fn prep_close(sqe: *Sqe, fd: linux.fd_t) void {
-        sqe.* = .{
-            .opcode = .CLOSE,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = fd,
-            .off = 0,
-            .addr = 0,
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = 0,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-    }
-
-    pub fn prep_close_direct(sqe: *Sqe, file_index: u32) void {
-        prep_close(sqe, 0);
-        __io_uring_set_target_fixed_file(sqe, file_index);
-    }
-
-    pub fn prep_timeout(
-        sqe: *Sqe,
-        ts: *const linux.kernel_timespec,
-        count: u32,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.TIMEOUT, -1, @intFromPtr(ts), 1, count);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_timeout_remove(sqe: *Sqe, timeout_user_data: u64, flags: u32) void {
-        sqe.* = .{
-            .opcode = .TIMEOUT_REMOVE,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = -1,
-            .off = 0,
-            .addr = timeout_user_data,
-            .len = 0,
-            .rw_flags = flags,
-            .user_data = 0,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-    }
-
-    pub fn prep_link_timeout(
-        sqe: *Sqe,
-        ts: *const linux.kernel_timespec,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.LINK_TIMEOUT, -1, @intFromPtr(ts), 1, 0);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_poll_add(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        poll_mask: u32,
-    ) void {
-        sqe.prep_rw(.POLL_ADD, fd, @intFromPtr(@as(?*anyopaque, null)), 0, 0);
-        // Poll masks previously used to comprise of 16 bits in the flags union of
-        // a SQE, but were then extended to comprise of 32 bits in order to make
-        // room for additional option flags. To ensure that the correct bits of
-        // poll masks are consistently and properly read across multiple kernel
-        // versions, poll masks are enforced to be little-endian.
-        // https://www.spinics.net/lists/io-uring/msg02848.html
-        sqe.rw_flags = std.mem.nativeToLittle(u32, poll_mask);
-    }
-
-    pub fn prep_poll_remove(
-        sqe: *Sqe,
-        target_user_data: u64,
-    ) void {
-        sqe.prep_rw(.POLL_REMOVE, -1, target_user_data, 0, 0);
-    }
-
-    pub fn prep_poll_update(
-        sqe: *Sqe,
-        old_user_data: u64,
-        new_user_data: u64,
-        poll_mask: u32,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.POLL_REMOVE, -1, old_user_data, flags, new_user_data);
-        // Poll masks previously used to comprise of 16 bits in the flags union of
-        // a SQE, but were then extended to comprise of 32 bits in order to make
-        // room for additional option flags. To ensure that the correct bits of
-        // poll masks are consistently and properly read across multiple kernel
-        // versions, poll masks are enforced to be little-endian.
-        // https://www.spinics.net/lists/io-uring/msg02848.html
-        sqe.rw_flags = std.mem.nativeToLittle(u32, poll_mask);
-    }
-
-    pub fn prep_fallocate(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        mode: i32,
-        offset: u64,
-        len: u64,
-    ) void {
-        sqe.* = .{
-            .opcode = .FALLOCATE,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = fd,
-            .off = offset,
-            .addr = len,
-            .len = @intCast(mode),
-            .rw_flags = 0,
-            .user_data = 0,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-    }
-
-    pub fn prep_statx(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        path: [*:0]const u8,
-        flags: u32,
-        mask: linux.STATX,
-        buf: *linux.Statx,
-    ) void {
-        sqe.prep_rw(.STATX, fd, @intFromPtr(path), @as(u32, @bitCast(mask)), @intFromPtr(buf));
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_cancel(
-        sqe: *Sqe,
-        cancel_user_data: u64,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.ASYNC_CANCEL, -1, cancel_user_data, 0, 0);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_cancel_fd(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.ASYNC_CANCEL, fd, 0, 0, 0);
-        sqe.rw_flags = flags | linux.IORING_ASYNC_CANCEL_FD;
-    }
-
-    pub fn prep_shutdown(
-        sqe: *Sqe,
-        sockfd: linux.socket_t,
-        how: u32,
-    ) void {
-        sqe.prep_rw(.SHUTDOWN, sockfd, 0, how, 0);
-    }
-
-    pub fn prep_renameat(
-        sqe: *Sqe,
-        old_dir_fd: linux.fd_t,
-        old_path: [*:0]const u8,
-        new_dir_fd: linux.fd_t,
-        new_path: [*:0]const u8,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(
-            .RENAMEAT,
-            old_dir_fd,
-            @intFromPtr(old_path),
-            0,
-            @intFromPtr(new_path),
-        );
-        sqe.len = @bitCast(new_dir_fd);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_unlinkat(
-        sqe: *Sqe,
-        dir_fd: linux.fd_t,
-        path: [*:0]const u8,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.UNLINKAT, dir_fd, @intFromPtr(path), 0, 0);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_mkdirat(
-        sqe: *Sqe,
-        dir_fd: linux.fd_t,
-        path: [*:0]const u8,
-        mode: linux.mode_t,
-    ) void {
-        sqe.prep_rw(.MKDIRAT, dir_fd, @intFromPtr(path), mode, 0);
-    }
-
-    pub fn prep_symlinkat(
-        sqe: *Sqe,
-        target: [*:0]const u8,
-        new_dir_fd: linux.fd_t,
-        link_path: [*:0]const u8,
-    ) void {
-        sqe.prep_rw(
-            .SYMLINKAT,
-            new_dir_fd,
-            @intFromPtr(target),
-            0,
-            @intFromPtr(link_path),
-        );
-    }
-
-    pub fn prep_linkat(
-        sqe: *Sqe,
-        old_dir_fd: linux.fd_t,
-        old_path: [*:0]const u8,
-        new_dir_fd: linux.fd_t,
-        new_path: [*:0]const u8,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(
-            .LINKAT,
-            old_dir_fd,
-            @intFromPtr(old_path),
-            0,
-            @intFromPtr(new_path),
-        );
-        sqe.len = @bitCast(new_dir_fd);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_files_update(
-        sqe: *Sqe,
-        fds: []const linux.fd_t,
-        offset: u32,
-    ) void {
-        sqe.prep_rw(.FILES_UPDATE, -1, @intFromPtr(fds.ptr), fds.len, @intCast(offset));
-    }
-
-    pub fn prep_files_update_alloc(
-        sqe: *Sqe,
-        fds: []linux.fd_t,
-    ) void {
-        sqe.prep_rw(.FILES_UPDATE, -1, @intFromPtr(fds.ptr), fds.len, linux.IORING_FILE_INDEX_ALLOC);
-    }
-
-    pub fn prep_provide_buffers(
-        sqe: *Sqe,
-        buffers: [*]u8,
-        buffer_len: usize,
-        num: usize,
-        group_id: usize,
-        buffer_id: usize,
-    ) void {
-        const ptr = @intFromPtr(buffers);
-        sqe.prep_rw(.PROVIDE_BUFFERS, @intCast(num), ptr, buffer_len, buffer_id);
-        sqe.buf_index = @intCast(group_id);
-    }
-
-    pub fn prep_remove_buffers(
-        sqe: *Sqe,
-        num: usize,
-        group_id: usize,
-    ) void {
-        sqe.prep_rw(.REMOVE_BUFFERS, @intCast(num), 0, 0, 0);
-        sqe.buf_index = @intCast(group_id);
-    }
-
-    pub fn prep_multishot_accept(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        addr: ?*linux.sockaddr,
-        addrlen: ?*linux.socklen_t,
-        flags: u32,
-    ) void {
-        prep_accept(sqe, fd, addr, addrlen, flags);
-        sqe.ioprio |= linux.IORING_ACCEPT_MULTISHOT;
-    }
-
-    pub fn prep_socket(
-        sqe: *Sqe,
-        domain: u32,
-        socket_type: u32,
-        protocol: u32,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.SOCKET, @intCast(domain), 0, protocol, socket_type);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_socket_direct(
-        sqe: *Sqe,
-        domain: u32,
-        socket_type: u32,
-        protocol: u32,
-        flags: u32,
-        file_index: u32,
-    ) void {
-        prep_socket(sqe, domain, socket_type, protocol, flags);
-        __io_uring_set_target_fixed_file(sqe, file_index);
-    }
-
-    pub fn prep_socket_direct_alloc(
-        sqe: *Sqe,
-        domain: u32,
-        socket_type: u32,
-        protocol: u32,
-        flags: u32,
-    ) void {
-        prep_socket(sqe, domain, socket_type, protocol, flags);
-        __io_uring_set_target_fixed_file(sqe, linux.IORING_FILE_INDEX_ALLOC);
-    }
-
-    pub fn prep_waitid(
-        sqe: *Sqe,
-        id_type: linux.P,
-        id: i32,
-        infop: *linux.siginfo_t,
-        options: u32,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.WAITID, id, 0, @backingInt(id_type), @intFromPtr(infop));
-        sqe.rw_flags = flags;
-        sqe.splice_fd_in = @bitCast(options);
-    }
-
-    pub fn prep_pipe(
-        sqe: *Sqe,
-        fds: *[2]linux.fd_t,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.PIPE, 0, @intFromPtr(fds), 0, 0);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_bind(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        addr: *const linux.sockaddr,
-        addrlen: linux.socklen_t,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.BIND, fd, @intFromPtr(addr), 0, addrlen);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_listen(
-        sqe: *Sqe,
-        fd: linux.fd_t,
-        backlog: usize,
-        flags: u32,
-    ) void {
-        sqe.prep_rw(.LISTEN, fd, 0, backlog, 0);
-        sqe.rw_flags = flags;
-    }
-
-    pub fn prep_cmd_sock(
-        sqe: *Sqe,
-        cmd_op: linux.IO_URING_SOCKET_OP,
-        fd: linux.fd_t,
-        level: u32,
-        optname: u32,
-        optval: u64,
-        optlen: u32,
-    ) void {
-        sqe.prep_rw(.URING_CMD, fd, 0, 0, 0);
-        // off is overloaded with cmd_op, https://github.com/axboe/liburing/blob/e1003e496e66f9b0ae06674869795edf772d5500/src/include/liburing/io_uring.h#L39
-        sqe.off = @backingInt(cmd_op);
-        // addr is overloaded, https://github.com/axboe/liburing/blob/e1003e496e66f9b0ae06674869795edf772d5500/src/include/liburing/io_uring.h#L46
-        sqe.addr = @bitCast(packed struct {
-            level: u32,
-            optname: u32,
-        }{
-            .level = level,
-            .optname = optname,
-        });
-        // splice_fd_in if overloaded u32 -> i32
-        sqe.splice_fd_in = @bitCast(optlen);
-        // addr3 is overloaded, https://github.com/axboe/liburing/blob/e1003e496e66f9b0ae06674869795edf772d5500/src/include/liburing/io_uring.h#L102
-        sqe.addr3 = optval;
-    }
-
-    pub fn set_flags(sqe: *Sqe, flags: u8) void {
-        sqe.flags |= flags;
-    }
-
-    /// This SQE forms a link with the next SQE in the submission ring. Next SQE
-    /// will not be started before this one completes. Forms a chain of SQEs.
-    pub fn linkNext(sqe: *Sqe) void {
-        sqe.flags |= linux.IOSQE_IO_LINK;
-    }
-    pub fn skipSuccess(sqe: *Sqe) void {
-        sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
     }
 
     pub fn splice(
@@ -701,9 +84,9 @@ pub const Sqe = extern struct {
         flags: u32,
     ) void {
         sqe.prep_rw(.SPLICE, fd_out, off_in, len, off_out);
-        sqe.splice_fd_in = fd_in;
+        sqe.c = .{ .splice_fd_in = fd_in };
         sqe.user_data = user_data;
-        sqe.rw_flags = flags;
+        sqe.op_flags = flags;
     }
 
     pub fn pipe(
@@ -715,7 +98,7 @@ pub const Sqe = extern struct {
         const OP_PIPE = 62;
         sqe.prep_rw(@fromBackingInt(@intCast(OP_PIPE)), 0, @intFromPtr(fds), 0, 0);
         sqe.user_data = user_data;
-        sqe.rw_flags = flags;
+        sqe.op_flags = flags;
     }
 
     pub fn listen(
@@ -727,7 +110,7 @@ pub const Sqe = extern struct {
     ) void {
         sqe.prep_rw(.LISTEN, fd, 0, backlog, 0);
         sqe.user_data = user_data;
-        sqe.rw_flags = flags;
+        sqe.op_flags = flags;
     }
 
     pub fn statx(
@@ -741,7 +124,7 @@ pub const Sqe = extern struct {
     ) void {
         sqe.prep_rw(.STATX, fd, @intFromPtr(path), @as(u32, @bitCast(mask)), @intFromPtr(buf));
         sqe.user_data = user_data;
-        sqe.rw_flags = flags;
+        sqe.op_flags = flags;
     }
 
     pub fn sendmsg(
@@ -753,7 +136,7 @@ pub const Sqe = extern struct {
     ) void {
         sqe.prep_rw(.SENDMSG, fd, @intFromPtr(msg), 1, 0);
         sqe.user_data = user_data;
-        sqe.rw_flags = flags;
+        sqe.op_flags = flags;
     }
 
     pub fn send(
@@ -765,7 +148,7 @@ pub const Sqe = extern struct {
     ) void {
         sqe.prep_rw(.SEND, fd, @intFromPtr(buffer.ptr), buffer.len, 0);
         sqe.user_data = user_data;
-        sqe.rw_flags = flags;
+        sqe.op_flags = flags;
     }
 
     pub fn socket(
@@ -778,36 +161,24 @@ pub const Sqe = extern struct {
     ) void {
         sqe.prep_rw(.SOCKET, @intCast(domain), 0, protocol, socket_type);
         sqe.user_data = user_data;
-        sqe.rw_flags = flags;
+        sqe.op_flags = flags;
     }
 
     pub fn setsockopt(
         sqe: *Sqe,
         user_data: u64,
         fd: linux.fd_t,
-        level: i32,
+        level: u32,
         opt_name: u32,
         optval: u64,
         optlen: u32,
     ) void {
         sqe.prep_rw(.URING_CMD, fd, 0, 0, 0);
         sqe.user_data = user_data;
-
-        const off: extern struct {
-            cmd_op: linux.IO_URING_SOCKET_OP,
-            pad: u32,
-        } align(@alignOf(u64)) = .{
-            .cmd_op = .SETSOCKOPT,
-            .pad = 0,
-        };
-        const addr: extern struct { level: i32, opt_name: u32 } align(@alignOf(u64)) = .{
-            .level = level,
-            .opt_name = opt_name,
-        };
-        sqe.off = @as(*const u64, @ptrCast(&off)).*;
-        sqe.addr = @as(*const u64, @ptrCast(&addr)).*;
-        sqe.splice_fd_in = @intCast(optlen);
-        sqe.addr3 = optval;
+        sqe.a = .{ .opt = .{ .cmd = .SETSOCKOPT } };
+        sqe.b = .{ .opt = .{ .level = level, .name = opt_name } };
+        sqe.c = .{ .optlen = optlen };
+        sqe.d = .{ .optval = optval };
     }
 
     pub fn getsockname(
@@ -819,11 +190,10 @@ pub const Sqe = extern struct {
     ) void {
         sqe.prep_rw(.URING_CMD, fd, 0, 0, 0);
         sqe.user_data = user_data;
-
-        sqe.off = @backingInt(linuxx.IO_URING_SOCKET_OP.GETSOCKNAME);
-        sqe.addr = @intFromPtr(addr);
-        sqe.splice_fd_in = 0; // optlen: 0 - local, 1 - peer
-        sqe.addr3 = @intFromPtr(addr_len);
+        sqe.a = .{ .opt = .{ .cmd = .GETSOCKNAME } };
+        sqe.b = .{ .addr = @intFromPtr(addr) };
+        sqe.c = .{ .optlen = 0 }; // optlen: 0 - local, 1 - peer
+        sqe.d = .{ .addr3 = @intFromPtr(addr_len) };
     }
 
     pub fn asyncCancel(
@@ -833,25 +203,13 @@ pub const Sqe = extern struct {
     ) void {
         sqe.prep_rw(.ASYNC_CANCEL, -1, cancel_user_data, 0, 0);
         sqe.user_data = user_data;
-        sqe.flags = linux.IOSQE_CQE_SKIP_SUCCESS;
+        sqe.flags.cqe_skip_success = true;
     }
 
     pub fn nop(sqe: *Sqe, user_data: u64) void {
         sqe.* = .{
             .opcode = .NOP,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = 0,
-            .off = 0,
-            .addr = 0,
-            .len = 0,
-            .rw_flags = 0,
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
         };
     }
 
@@ -932,7 +290,7 @@ pub const Sqe = extern struct {
         flags: u32,
     ) void {
         sqe.prep_rw(.LINK_TIMEOUT, -1, @intFromPtr(ts), 1, 0);
-        sqe.rw_flags = flags;
+        sqe.op_flags = flags;
         sqe.user_data = user_data;
     }
 
@@ -955,7 +313,7 @@ pub const Sqe = extern struct {
     ) void {
         sqe.prep_rw(.RECVMSG, fd, @intFromPtr(msg), 1, 0);
         sqe.user_data = user_data;
-        sqe.rw_flags = flags;
+        sqe.op_flags = flags;
     }
 
     pub fn accept(
@@ -968,7 +326,7 @@ pub const Sqe = extern struct {
     ) void {
         sqe.prep_rw(.ACCEPT, fd, @intFromPtr(addr), 0, @intFromPtr(addrlen));
         sqe.user_data = user_data;
-        sqe.rw_flags = flags;
+        sqe.op_flags = flags;
     }
 
     pub fn timeout(
@@ -980,25 +338,14 @@ pub const Sqe = extern struct {
     ) void {
         sqe.prep_rw(.TIMEOUT, -1, @intFromPtr(ts), 1, count);
         sqe.user_data = user_data;
-        sqe.rw_flags = flags;
+        sqe.op_flags = flags;
     }
 
     pub fn timeoutRemove(sqe: *Sqe, user_data: u64, timeout_user_data: u64) void {
         sqe.* = .{
             .opcode = .TIMEOUT_REMOVE,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = 0,
-            .off = 0,
-            .addr = timeout_user_data,
-            .len = 0,
-            .rw_flags = 0,
+            .b = .{ .addr = timeout_user_data },
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
         };
     }
 
@@ -1012,19 +359,11 @@ pub const Sqe = extern struct {
     ) void {
         sqe.* = .{
             .opcode = .WAITID,
-            .flags = 0,
-            .ioprio = 0,
             .fd = id,
-            .off = @intFromPtr(&infop),
-            .addr = 0,
+            .a = .{ .addr2 = @intFromPtr(&infop) },
             .len = @backingInt(id_type),
-            .rw_flags = 0,
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = @bitCast(options),
-            .addr3 = 0,
-            .resv = 0,
+            .c = .{ .optlen = options },
         };
     }
 
@@ -1035,19 +374,8 @@ pub const Sqe = extern struct {
     ) void {
         sqe.* = .{
             .opcode = .CLOSE,
-            .flags = 0,
-            .ioprio = 0,
             .fd = fd,
-            .off = 0,
-            .addr = 0,
-            .len = 0,
-            .rw_flags = 0,
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
         };
     }
 
@@ -1068,23 +396,16 @@ pub const Sqe = extern struct {
             @intFromPtr(new_path),
         );
         sqe.len = @bitCast(new_dir_fd);
-        sqe.rw_flags = flags;
+        sqe.op_flags = flags;
 
         sqe.* = .{
             .opcode = .LINKAT,
-            .flags = 0,
-            .ioprio = 0,
             .fd = old_dir_fd,
-            .off = @intFromPtr(new_path),
-            .addr = @intFromPtr(old_path),
+            .a = .{ .addr2 = @intFromPtr(new_path) },
+            .b = .{ .addr = @intFromPtr(old_path) },
             .len = @bitCast(new_dir_fd),
-            .rw_flags = flags,
+            .op_flags = flags,
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
         };
     }
 
@@ -1097,19 +418,10 @@ pub const Sqe = extern struct {
     ) void {
         sqe.* = .{
             .opcode = .SYMLINKAT,
-            .flags = 0,
-            .ioprio = 0,
             .fd = new_dir_fd,
-            .off = @intFromPtr(link_path),
-            .addr = @intFromPtr(target),
-            .len = 0,
-            .rw_flags = 0,
+            .a = .{ .addr2 = @intFromPtr(link_path) },
+            .b = .{ .addr = @intFromPtr(target) },
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
         };
     }
 
@@ -1123,19 +435,11 @@ pub const Sqe = extern struct {
     ) void {
         sqe.* = .{
             .opcode = .OPENAT,
-            .flags = 0,
-            .ioprio = 0,
             .fd = fd,
-            .off = 0,
-            .addr = @intFromPtr(path),
+            .b = .{ .addr = @intFromPtr(path) },
             .len = mode,
-            .rw_flags = @bitCast(flags),
+            .op_flags = @bitCast(flags),
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
         };
     }
 
@@ -1148,19 +452,10 @@ pub const Sqe = extern struct {
     ) void {
         sqe.* = .{
             .opcode = .UNLINKAT,
-            .flags = 0,
-            .ioprio = 0,
             .fd = dir_fd,
-            .off = 0,
-            .addr = @intFromPtr(path),
-            .len = 0,
-            .rw_flags = flags,
+            .b = .{ .addr = @intFromPtr(path) },
+            .op_flags = flags,
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
         };
     }
 
@@ -1172,19 +467,9 @@ pub const Sqe = extern struct {
     ) void {
         sqe.* = .{
             .opcode = .FSYNC,
-            .flags = 0,
-            .ioprio = 0,
             .fd = fd,
-            .off = 0,
-            .addr = 0,
-            .len = 0,
-            .rw_flags = flags,
+            .op_flags = flags,
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
         };
     }
 
@@ -1197,19 +482,10 @@ pub const Sqe = extern struct {
     ) void {
         sqe.* = .{
             .opcode = .FTRUNCATE,
-            .flags = 0,
-            .ioprio = 0,
             .fd = fd,
-            .off = length,
-            .addr = 0,
-            .len = 0,
-            .rw_flags = flags,
+            .a = .{ .offset = length },
+            .op_flags = flags,
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
         };
     }
 
@@ -1224,19 +500,12 @@ pub const Sqe = extern struct {
     ) void {
         sqe.* = .{
             .opcode = .RENAMEAT,
-            .flags = 0,
-            .ioprio = 0,
             .fd = old_dir_fd,
-            .off = @intFromPtr(new_path),
-            .addr = @intFromPtr(old_path),
+            .a = .{ .addr2 = @intFromPtr(new_path) },
+            .b = .{ .addr = @intFromPtr(old_path) },
             .len = @bitCast(new_dir_fd),
-            .rw_flags = @bitCast(flags),
+            .op_flags = @bitCast(flags),
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
         };
     }
 
@@ -1248,19 +517,11 @@ pub const Sqe = extern struct {
     ) void {
         sqe.* = .{
             .opcode = .FUTEX_WAIT,
-            .flags = 0,
-            .ioprio = 0,
             .fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true }),
-            .off = expected,
-            .addr = @intFromPtr(ptr),
-            .len = 0,
-            .rw_flags = 0,
+            .a = .{ .offset = expected },
+            .b = .{ .addr = @intFromPtr(ptr) },
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = std.math.maxInt(u32),
-            .resv = 0,
+            .d = .{ .addr3 = std.math.maxInt(u32) },
         };
     }
 
@@ -1272,19 +533,12 @@ pub const Sqe = extern struct {
     ) void {
         sqe.* = .{
             .opcode = .FUTEX_WAKE,
-            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-            .ioprio = 0,
+            .flags = .{ .cqe_skip_success = true },
             .fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true }),
-            .off = max_waiters,
-            .addr = @intFromPtr(ptr),
-            .len = 0,
-            .rw_flags = 0,
+            .a = .{ .offset = max_waiters },
+            .b = .{ .addr = @intFromPtr(ptr) },
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = std.math.maxInt(u32),
-            .resv = 0,
+            .d = .{ .addr3 = std.math.maxInt(u32) },
         };
     }
 
@@ -1295,39 +549,12 @@ pub const Sqe = extern struct {
         path: [*:0]const u8,
         mode: linux.mode_t,
     ) void {
-        sqe.prep_rw(.MKDIRAT, dir_fd, @intFromPtr(path), mode, 0);
         sqe.* = .{
             .opcode = .MKDIRAT,
-            .flags = 0,
-            .ioprio = 0,
             .fd = dir_fd,
-            .off = 0,
-            .addr = @intFromPtr(path),
+            .b = .{ .addr = @intFromPtr(path) },
             .len = mode,
-            .rw_flags = 0,
             .user_data = user_data,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
         };
     }
-
-    pub const empty = .{
-        .opcode = 0,
-        .flags = 0,
-        .ioprio = 0,
-        .fd = 0,
-        .off = 0,
-        .addr = 0,
-        .len = 0,
-        .rw_flags = 0,
-        .user_data = 0,
-        .buf_index = 0,
-        .personality = 0,
-        .splice_fd_in = 0,
-        .addr3 = 0,
-        .resv = 0,
-    };
 };
