@@ -1944,40 +1944,22 @@ fn dirCreateDirPath(
     }
 }
 
-fn filePathKind(ev: *Evented, dir: Dir, sub_path: []const u8) !File.Kind {
+const FilePathStatError = Io.Cancelable || Dir.PathNameError || error{ SystemResources, Unexpected };
+
+fn filePathKind(ev: *Evented, dir: Dir, sub_path: []const u8) FilePathStatError!File.Kind {
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
-
-    while (true) {
-        var statx_buf = std.mem.zeroes(linux.Statx);
-        const sqe, const fiber = try ev.enqueue();
-        sqe.statx(
-            @intFromPtr(fiber),
-            dir.handle,
-            sub_path_posix.ptr,
-            linux.STATX{ .TYPE = true },
-            &statx_buf,
-            linux.AT.NO_AUTOMOUNT | linux.AT.SYMLINK_NOFOLLOW,
-        );
-        ev.yield(null, .nothing);
-        switch (fiber.errno()) {
-            .SUCCESS => {
-                if (!statx_buf.mask.TYPE) return error.Unexpected;
-                return statxKind(statx_buf.mode);
-            },
-            .INTR, .CANCELED => {},
-            .ACCES => |err| return errnoBug(err),
-            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
-            .FAULT => |err| return errnoBug(err),
-            .INVAL => |err| return errnoBug(err),
-            .LOOP => |err| return errnoBug(err),
-            .NAMETOOLONG => |err| return errnoBug(err),
-            .NOENT => |err| return errnoBug(err),
-            .NOMEM => return error.SystemResources,
-            .NOTDIR => |err| return errnoBug(err),
-            else => |err| return unexpectedErrno(err),
-        }
+    const linux_statx, const errno = try ev.statxRaw(
+        dir.handle,
+        sub_path_posix.ptr,
+        linux.STATX{ .TYPE = true },
+        linux.AT.NO_AUTOMOUNT | linux.AT.SYMLINK_NOFOLLOW,
+    );
+    if (linux_statx) |ls| {
+        if (!ls.mask.SIZE) return error.Unexpected;
+        return statxKind(ls.mode);
     }
+    return errnoToError(FilePathStatError, errno);
 }
 
 fn dirCreateDirPathOpen(
@@ -2755,38 +2737,19 @@ fn fileStat(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
     return ev.stat(file.handle);
 }
 
-fn fileLength(userdata: ?*anyopaque, file: File) File.LengthError!u64 {
+fn fileLength(userdata: ?*anyopaque, file: File) File.StatError!u64 {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    while (true) {
-        var statx_buf = std.mem.zeroes(linux.Statx);
-        const sqe, const fiber = try ev.enqueue();
-        sqe.statx(
-            @intFromPtr(fiber),
-            file.handle,
-            "",
-            linux.STATX{ .SIZE = true },
-            &statx_buf,
-            linux.AT.EMPTY_PATH,
-        );
-        ev.yield(null, .nothing);
-        switch (fiber.errno()) {
-            .SUCCESS => {
-                if (!statx_buf.mask.SIZE) return error.Unexpected;
-                return statx_buf.size;
-            },
-            .INTR, .CANCELED => {},
-            .ACCES => |err| return errnoBug(err),
-            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
-            .FAULT => |err| return errnoBug(err),
-            .INVAL => |err| return errnoBug(err),
-            .LOOP => |err| return errnoBug(err),
-            .NAMETOOLONG => |err| return errnoBug(err),
-            .NOENT => |err| return errnoBug(err),
-            .NOMEM => return error.SystemResources,
-            .NOTDIR => |err| return errnoBug(err),
-            else => |err| return unexpectedErrno(err),
-        }
+    const linux_statx, const errno = try ev.statxRaw(
+        file.handle,
+        "",
+        linux.STATX{ .SIZE = true },
+        linux.AT.EMPTY_PATH,
+    );
+    if (linux_statx) |ls| {
+        if (!ls.mask.SIZE) return error.Unexpected;
+        return ls.size;
     }
+    return errnoToError(File.StatError, errno);
 }
 
 fn fileClose(userdata: ?*anyopaque, files: []const File) void {
@@ -4911,41 +4874,40 @@ fn socket(
     return socket_fd;
 }
 
-fn stat(ev: *Evented, fd: fd_t) Dir.StatError!Dir.Stat {
-    return ev.statx(fd, "", linux.AT.EMPTY_PATH) catch |err| switch (err) {
-        error.BadPathName, error.NameTooLong => unreachable, // path is empty
-        error.AccessDenied => return errnoBug(.ACCES),
-        error.SymLinkLoop => return errnoBug(.LOOP),
-        error.FileNotFound => return errnoBug(.NOENT),
-        error.NotDir => return errnoBug(.NOTDIR),
-        else => |e| return e,
-    };
+fn stat(ev: *Evented, fd: fd_t) File.StatError!Dir.Stat {
+    const linux_statx, const errno = try ev.statxRaw(fd, "", linux_statx_request, linux.AT.EMPTY_PATH);
+    if (linux_statx) |ls| return statFromLinux(&ls);
+    return errnoToError(File.StatError, errno);
 }
 
+const StatxError = Dir.StatError || Dir.PathNameError || error{ FileNotFound, NotDir, SymLinkLoop };
 fn statx(
     ev: *Evented,
     dir: fd_t,
     path: [*:0]const u8,
     flags: u32,
-) (Dir.StatError || Dir.PathNameError || error{ FileNotFound, NotDir, SymLinkLoop })!Dir.Stat {
+) StatxError!Dir.Stat {
+    const linux_statx, const errno = try ev.statxRaw(dir, path, linux_statx_request, flags);
+    if (linux_statx) |ls| return statFromLinux(&ls);
+    return errnoToError(StatxError, errno);
+}
+
+fn statxRaw(
+    ev: *Evented,
+    fd: fd_t,
+    path: [*:0]const u8,
+    mask: linux.STATX,
+    flags: u32,
+) Io.Cancelable!struct { ?linux.Statx, linux.E } {
     while (true) {
         var statx_buf = std.mem.zeroes(linux.Statx);
         const sqe, const fiber = try ev.enqueue();
-        sqe.statx(@intFromPtr(fiber), dir, path, linux_statx_request, &statx_buf, flags);
+        sqe.statx(@intFromPtr(fiber), fd, path, mask, &statx_buf, flags);
         ev.yield(null, .nothing);
         switch (fiber.errno()) {
-            .SUCCESS => return statFromLinux(&statx_buf),
+            .SUCCESS => |errno| return .{ statx_buf, errno },
             .INTR, .CANCELED => {},
-            .ACCES => return error.AccessDenied,
-            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
-            .FAULT => |err| return errnoBug(err),
-            .INVAL => |err| return errnoBug(err),
-            .LOOP => return error.SymLinkLoop,
-            .NAMETOOLONG => |err| return errnoBug(err),
-            .NOENT => return error.FileNotFound,
-            .NOTDIR => return error.NotDir,
-            .NOMEM => return error.SystemResources,
-            else => |err| return unexpectedErrno(err),
+            else => |errno| return .{ null, errno },
         }
     }
 }
@@ -5318,6 +5280,34 @@ fn errnoToError(comptime ErrorSet: type, errno: linux.E) ErrorSet {
             .PIPE => error.SocketUnconnected,
             .NETDOWN => error.NetworkDown,
             else => |err| unexpectedErrno(err),
+        },
+        FilePathStatError, File.StatError => switch (errno) {
+            .SUCCESS => unreachable,
+            .INTR, .CANCELED => unreachable,
+            .ACCES => |err| return errnoBug(err),
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .LOOP => |err| return errnoBug(err),
+            .NAMETOOLONG => |err| return errnoBug(err),
+            .NOENT => |err| return errnoBug(err),
+            .NOMEM => return error.SystemResources,
+            .NOTDIR => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        },
+        StatxError => switch (errno) {
+            .SUCCESS => unreachable,
+            .INTR, .CANCELED => unreachable,
+            .ACCES => return error.AccessDenied,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .LOOP => return error.SymLinkLoop,
+            .NAMETOOLONG => |err| return errnoBug(err),
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDir,
+            .NOMEM => return error.SystemResources,
+            else => |err| return unexpectedErrno(err),
         },
         else => comptime unreachable,
     };
