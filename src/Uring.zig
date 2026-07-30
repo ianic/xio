@@ -277,79 +277,27 @@ const Fiber = struct {
 };
 
 const CachedFd = struct {
-    once: Once,
+    fd: fd_t = -1,
 
-    const Once = enum(fd_t) {
-        uninitialized = -1,
-        initializing = -2,
-        /// fd
-        _,
-
-        fn fromFd(fd: fd_t) Once {
-            return @fromBackingInt(@intCast(@as(u31, @intCast(fd))));
-        }
-
-        fn toFd(once: Once) fd_t {
-            return @as(u31, @intCast(@backingInt(once)));
-        }
-    };
-
-    const init: CachedFd = .{ .once = .uninitialized };
-
-    fn close(cached_fd: *CachedFd) void {
-        switch (cached_fd.once) {
-            .uninitialized => {},
-            .initializing => unreachable,
-            _ => |fd| {
-                assert(@backingInt(fd) >= 0);
-                _ = linux.close(@backingInt(fd));
-                cached_fd.* = .init;
-            },
+    fn close(self: *CachedFd) void {
+        if (self.fd != -1) {
+            _ = linux.close(self.fd);
         }
     }
 
     fn open(
-        cached_fd: *CachedFd,
+        self: *CachedFd,
         ev: *Evented,
         path: [*:0]const u8,
         flags: linux.O,
     ) File.OpenError!fd_t {
-        var once = @atomicLoad(Once, &cached_fd.once, .monotonic);
-        while (true) {
-            switch (once) {
-                .uninitialized => {},
-                .initializing => try futexWait(
-                    ev,
-                    @ptrCast(&cached_fd.once),
-                    @bitCast(@backingInt(once)),
-                    .none,
-                ),
-                _ => |fd| {
-                    @branchHint(.likely);
-                    return fd.toFd();
-                },
-            }
-            once = @cmpxchgWeak(
-                Once,
-                &cached_fd.once,
-                .uninitialized,
-                .initializing,
-                .monotonic,
-                .monotonic,
-            ) orelse {
-                errdefer {
-                    @atomicStore(Once, &cached_fd.once, .uninitialized, .monotonic);
-                    futexWake(ev, @ptrCast(&cached_fd.once), 1);
-                }
-                const fd = ev.openat(linux.AT.FDCWD, path, flags, 0) catch |err| switch (err) {
-                    error.OperationUnsupported => return error.Unexpected, // TMPFILE unset.
-                    else => |e| return e,
-                };
-                @atomicStore(Once, &cached_fd.once, .fromFd(fd), .monotonic);
-                futexWake(ev, @ptrCast(&cached_fd.once), std.math.maxInt(u32));
-                return fd;
+        if (self.fd == -1) {
+            self.fd = ev.openat(linux.AT.FDCWD, path, flags, 0) catch |err| switch (err) {
+                error.OperationUnsupported => return error.Unexpected, // TMPFILE unset.
+                else => |e| return e,
             };
         }
+        return self.fd;
     }
 };
 
@@ -520,8 +468,8 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .environ_initialized = options.environ.block.isEmpty(),
         .environ = .{ .process_environ = options.environ },
 
-        .null_fd = .init,
-        .random_fd = .init,
+        .null_fd = .{},
+        .random_fd = .{},
 
         .csprng = .uninitialized,
         .allocated_slice = allocated_slice,

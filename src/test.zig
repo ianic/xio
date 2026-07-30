@@ -6,7 +6,7 @@ const assert = std.debug.assert;
 const testing = std.testing;
 const Uring = @import("Uring.zig");
 
-test "tcp echo" {
+test "tcp" {
     const gpa = testing.allocator;
 
     var uring: Uring = undefined;
@@ -19,14 +19,16 @@ test "tcp echo" {
     });
     defer threaded.deinit();
 
-    for ([_]Io{ threaded.io(), uring.io() }) |io| {
-        var addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
-        var server = try addr.listen(io, .{ .reuse_address = true });
-        addr = server.socket.address;
+    for (0..2) |_| {
+        for ([_]Io{ threaded.io(), uring.io() }) |io| {
+            var addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+            var server = try addr.listen(io, .{ .reuse_address = true });
+            addr = server.socket.address;
 
-        var f_server = io.async(echoServer, .{ io, &server });
-        var f_client = io.async(sendRecvClient, .{ io, addr, 4096, 2 });
-        try testing.expectEqual(try f_server.await(io), try f_client.await(io));
+            var f_server = io.async(echoServer, .{ io, &server });
+            var f_client = io.async(sendRecvClient, .{ io, addr, 4096, 2 });
+            try testing.expectEqual(try f_server.await(io), try f_client.await(io));
+        }
     }
 }
 
@@ -91,7 +93,7 @@ fn sendRecvClient(io: Io, addr: Io.net.IpAddress, bytes_count: usize, send_count
     return send_count * data.len;
 }
 
-test "tcp sendfile" {
+test "sendfile" {
     const S = struct {
         // Collect received data
         fn server(gpa: mem.Allocator, io: std.Io, srv: *Io.net.Server) ![]u8 {
@@ -349,4 +351,25 @@ test "batch" {
     try testing.expectEqual(36, sent);
     try testing.expect(recv > 0);
     try testing.expect(recv == 36 or recv == 10);
+}
+
+test "random" {
+    const gpa = testing.allocator;
+    var uring: Io.Uring = undefined;
+    try uring.init(gpa, .{});
+    defer uring.deinit();
+
+    const io = uring.io();
+    var buffer: [1024]u8 = @splat(0xff);
+    io.random(&buffer);
+    var n: usize = 0;
+    for (buffer, 1..) |c, i| {
+        _ = i;
+        // std.debug.print("{x:0<2} ", .{c});
+        // if (i % 8 == 0) std.debug.print(" ", .{});
+        // if (i % 32 == 0) std.debug.print("\n", .{});
+        if (c == 0xff) n += 1;
+    }
+    //std.debug.print("0xff count: {}\n", .{n});
+    try testing.expect(n < buffer.len);
 }
