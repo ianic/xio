@@ -179,26 +179,18 @@ const Fiber = struct {
     }
 
     fn create(ev: *Evented) error{OutOfMemory}!*Fiber {
-        if (@atomicRmw(?*Fiber, &ev.free_queue, .Xchg, finished, .acquire)) |free_fiber| {
+        if (ev.free_queue) |free_fiber| {
             assert(free_fiber != finished);
-            @atomicStore(?*Fiber, &ev.free_queue, free_fiber.status.free_next, .release);
+            ev.free_queue = free_fiber.status.free_next;
             return free_fiber;
         }
-        @atomicStore(?*Fiber, &ev.free_queue, null, .monotonic);
         return @ptrCast(try ev.backing_allocator.alignedAlloc(u8, .of(Fiber), allocation_size));
     }
 
     fn destroy(fiber: *Fiber, ev: *Evented) void {
         assert(fiber.status.queue_next == null);
-        fiber.status = .{ .free_next = @atomicLoad(?*Fiber, &ev.free_queue, .acquire) };
-        while (true) fiber.status.free_next = @cmpxchgWeak(
-            ?*Fiber,
-            &ev.free_queue,
-            fiber.status.free_next,
-            fiber,
-            .acq_rel,
-            .acquire,
-        ) orelse break;
+        fiber.status = .{ .free_next = ev.free_queue };
+        ev.free_queue = fiber;
     }
 
     fn allocatedSlice(f: *Fiber) []align(@alignOf(Fiber)) u8 {
@@ -515,8 +507,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
 pub fn deinit(ev: *Evented) void {
     const main_fiber: *Fiber = @ptrCast(&ev.main_fiber_buffer);
     assert(ev.currentFiber() == main_fiber);
-    const ready_fiber = @atomicLoad(?*Fiber, &ev.ready_queue, .monotonic);
-    assert(ready_fiber == null or ready_fiber == Fiber.finished); // pending async
+    assert(ev.ready_queue == null or ev.ready_queue == Fiber.finished); // pending async
     var next_fiber = ev.free_queue;
     while (next_fiber) |free_fiber| {
         next_fiber = free_fiber.status.free_next;
@@ -574,13 +565,12 @@ fn submit(ev: *Evented) void {
 }
 
 fn findReadyFiber(ev: *Evented) ?*Fiber {
-    if (@atomicRmw(?*Fiber, &ev.ready_queue, .Xchg, Fiber.finished, .acquire)) |ready_fiber| {
+    if (ev.ready_queue) |ready_fiber| {
         assert(ready_fiber != Fiber.finished);
-        @atomicStore(?*Fiber, &ev.ready_queue, ready_fiber.status.queue_next, .release);
+        ev.ready_queue = ready_fiber.status.queue_next;
         ready_fiber.status.queue_next = null;
         return ready_fiber;
     }
-    @atomicStore(?*Fiber, &ev.ready_queue, null, .monotonic);
     return null;
 }
 
@@ -600,14 +590,8 @@ fn yield(ev: *Evented, maybe_ready_fiber: ?*Fiber, pending_task: SwitchMessage.P
 }
 
 fn schedule(ev: *Evented, ready_queue: Fiber.Queue) void {
-    while (true) ready_queue.tail.status.queue_next = @cmpxchgWeak(
-        ?*Fiber,
-        &ev.ready_queue,
-        ready_queue.tail.status.queue_next,
-        ready_queue.head,
-        .acq_rel,
-        .acquire,
-    ) orelse break;
+    ready_queue.tail.status.queue_next = ev.ready_queue;
+    ev.ready_queue = ready_queue.head;
 }
 
 const Completion = struct {
@@ -726,19 +710,11 @@ fn idle(ev: *Evented) void {
                         const batch_userdata: *Io.Operation.Storage.Pending.Userdata =
                             @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
                         const batch: *Io.Batch = @ptrFromInt(batch_userdata[0]);
-                        var next: usize = 0b00;
+
+                        const next: usize = @as(*usize, @ptrCast(&batch.userdata)).*;
                         batch_userdata[0..3].* = .{ next, @as(u32, @bitCast(cqe.res)), cqe.flags };
-                        while (true) {
-                            next = @cmpxchgWeak(
-                                usize,
-                                @as(*usize, @ptrCast(&batch.userdata)),
-                                next,
-                                cqe.user_data,
-                                .release,
-                                .acquire,
-                            ) orelse break;
-                            batch_userdata[0] = next;
-                        }
+                        @as(*usize, @ptrCast(&batch.userdata)).* = cqe.user_data;
+
                         break :ready_fiber switch (@as(u2, @truncate(next))) {
                             0b00, 0b01 => @ptrFromInt(next & ~@as(usize, 0b11)),
                             0b10, 0b11 => null,
@@ -979,7 +955,7 @@ fn await(
 ) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const awaiting: *Fiber = @ptrCast(@alignCast(future));
-    if (@atomicLoad(?*Fiber, &awaiting.link.awaiter, .acquire) != Fiber.finished)
+    if (awaiting.link.awaiter != Fiber.finished)
         ev.yield(null, .{ .await = awaiting });
     @memcpy(result, awaiting.resultBytes(result_alignment));
     awaiting.destroy(ev);
