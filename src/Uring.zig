@@ -328,25 +328,25 @@ pub fn io(ev: *Evented) Io {
             .dirOpenDir = dirOpenDir,
             .dirStat = dirStat,
             .dirStatFile = dirStatFile,
-            .dirAccess = dirAccess,
+            .dirAccess = dirAccess, // sync
             .dirCreateFile = dirCreateFile,
             .dirCreateFileAtomic = dirCreateFileAtomic,
             .dirOpenFile = dirOpenFile,
             .dirClose = dirClose,
             .dirRead = dirRead,
-            .dirRealPath = dirRealPath,
-            .dirRealPathFile = dirRealPathFile,
+            .dirRealPath = dirRealPath, // sync
+            .dirRealPathFile = dirRealPathFile, // sync
             .dirDeleteFile = dirDeleteFile,
             .dirDeleteDir = dirDeleteDir,
             .dirRename = dirRename,
             .dirRenamePreserve = dirRenamePreserve,
             .dirSymLink = dirSymLink,
-            .dirReadLink = dirReadLink,
-            .dirSetOwner = dirSetOwner,
-            .dirSetFileOwner = dirSetFileOwner,
-            .dirSetPermissions = dirSetPermissions,
-            .dirSetFilePermissions = dirSetFilePermissions,
-            .dirSetTimestamps = dirSetTimestamps,
+            .dirReadLink = dirReadLink, // sync
+            .dirSetOwner = dirSetOwner, // sync
+            .dirSetFileOwner = dirSetFileOwner, // sync
+            .dirSetPermissions = dirSetPermissions, // sync
+            .dirSetFilePermissions = dirSetFilePermissions, // sync
+            .dirSetTimestamps = dirSetTimestamps, // sync
             .dirHardLink = dirHardLink,
 
             .fileStat = fileStat,
@@ -491,6 +491,8 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
             .flags = .{
                 .coop_taskrun = true,
                 .single_issuer = true,
+                .taskrun_flag = true,
+                .defer_taskrun = true, // needed for resize
             },
         }),
     };
@@ -527,7 +529,8 @@ fn currentFiber(ev: *Evented) *Fiber {
 
 fn getSqe(ev: *Evented) *IoUring.Sqe {
     while (true) return ev.io_uring.getSqe() catch {
-        ev.submit();
+        const sq_len: u32 = @intCast(ev.io_uring.sq.sqes.len);
+        ev.io_uring.resize(sq_len * 2, 0) catch ev.submit();
         continue;
     };
 }
@@ -664,8 +667,8 @@ fn idle(ev: *Evented) void {
         assert(ev.ready_queue == null);
         _ = ev.io_uring.submit(.{ .nr = 1 }) catch |err| switch (err) {
             error.SignalInterrupt => {},
-            error.SystemResources => {},
             error.TimeoutExpired => {},
+            error.SystemResources => {},
             error.CompletionQueueOvercommitted => {},
 
             error.FileDescriptorInvalid,

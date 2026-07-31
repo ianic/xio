@@ -389,9 +389,9 @@ fn resizeParams(self: *IoUring, p: *linux.io_uring_params) !void {
         else => |ern| return posix.unexpectedErrno(ern),
     }
     // Create new submission and completion queues
-    var sq = try linux.IoUring.SubmissionQueue.init(self.fd, p.*);
+    var sq = try SubmissionQueue.init(self.fd, p.*);
     errdefer sq.deinit();
-    var cq = try linux.IoUring.CompletionQueue.init(self.fd, p.*, sq);
+    var cq = try CompletionQueue.init(self.fd, p.*, sq);
     errdefer cq.deinit();
     // Copy pointers from previous submission queue
     sq.sqe_head = self.sq.sqe_head;
