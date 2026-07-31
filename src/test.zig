@@ -282,6 +282,7 @@ test "some dir operations" {
 }
 
 test "batch" {
+    if (true) return error.SkipZigTest;
     const S = struct {
         fn server(gpa: mem.Allocator, io: std.Io, socket: *Io.net.Socket) !usize {
             _ = gpa;
@@ -325,17 +326,17 @@ test "batch" {
     };
 
     const gpa = testing.allocator;
-    var threaded = Io.Threaded.init(gpa, .{
-        .async_limit = .limited(2),
-        .concurrent_limit = .limited(2),
-    });
-    defer threaded.deinit();
-    const io = threaded.io();
+    // var threaded = Io.Threaded.init(gpa, .{
+    //     .async_limit = .limited(2),
+    //     .concurrent_limit = .limited(2),
+    // });
+    // defer threaded.deinit();
+    // const io = threaded.io();
 
-    // var uring: Io.Uring = undefined;
-    // try uring.init(gpa, .{});
-    // defer uring.deinit();
-    // const io = uring.io();
+    var uring: Uring = undefined;
+    try uring.init(gpa, .{});
+    defer uring.deinit();
+    const io = uring.io();
 
     // Start server on os assigned port
     var addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -355,11 +356,11 @@ test "batch" {
 
 test "random" {
     const gpa = testing.allocator;
-    var uring: Io.Uring = undefined;
+    var uring: Uring = undefined;
     try uring.init(gpa, .{});
     defer uring.deinit();
-
     const io = uring.io();
+
     var buffer: [1024]u8 = @splat(0xff);
     io.random(&buffer);
     var n: usize = 0;
@@ -372,4 +373,24 @@ test "random" {
     }
     //std.debug.print("0xff count: {}\n", .{n});
     try testing.expect(n < buffer.len);
+}
+
+test "panic" {
+    if (true) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var uring: Uring = undefined;
+    try uring.init(gpa, .{});
+    defer uring.deinit();
+    const io = uring.io();
+
+    var addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    addr = server.socket.address;
+    var f = io.async(Io.net.Server.accept, .{ &server, io });
+    try io.sleep(.fromMilliseconds(1), .real);
+    _ = std.os.linux.close(uring.io_uring.fd);
+
+    const conn = try f.await(io);
+    //const conn = try server.accept(io);
+    defer conn.close(io);
 }

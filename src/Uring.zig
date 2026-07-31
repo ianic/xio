@@ -524,7 +524,7 @@ fn currentFiber(ev: *Evented) *Fiber {
 }
 
 fn getSqe(ev: *Evented) *IoUring.Sqe {
-    while (true) return ev.io_uring.get_sqe() catch {
+    while (true) return ev.io_uring.getSqe() catch {
         ev.submit();
         continue;
     };
@@ -558,7 +558,7 @@ fn enqueueSync(ev: *Evented) error{Canceled}!void {
 }
 
 fn submit(ev: *Evented) void {
-    _ = ev.io_uring.submit() catch |err| switch (err) {
+    _ = ev.io_uring.submit(.{}) catch |err| switch (err) {
         error.SignalInterrupt => {},
         else => |e| @panic(@errorName(e)),
     };
@@ -659,17 +659,28 @@ fn idle(ev: *Evented) void {
             ev.yield(ready_fiber, .nothing);
             maybe_ready_fiber = null;
         }
-        _ = ev.io_uring.submit_and_wait(1) catch |err| switch (err) {
+        assert(ev.ready_queue == null);
+        _ = ev.io_uring.submit(.{ .nr = 1 }) catch |err| switch (err) {
             error.SignalInterrupt => {},
-            else => |e| @panic(@errorName(e)),
+            error.SystemResources => {},
+            error.TimeoutExpired => {},
+            error.CompletionQueueOvercommitted => {},
+
+            error.FileDescriptorInvalid,
+            error.FileDescriptorInBadState,
+            error.SubmissionQueueEntryInvalid,
+            error.BufferInvalid,
+            error.RingShuttingDown,
+            error.OpcodeNotSupported,
+            error.InvalidThread,
+            error.SystemOutdated,
+            error.Unexpected,
+            => |e| @panic(@errorName(e)),
         };
         var maybe_ready_queue: ?Fiber.Queue = null;
         while (true) {
-            var cqes_buffer: [1 << 8]linux.io_uring_cqe = undefined;
-            const cqes = cqes_buffer[0 .. ev.io_uring.copy_cqes(&cqes_buffer, 0) catch |err| switch (err) {
-                error.SignalInterrupt => 0,
-                else => |e| @panic(@errorName(e)),
-            }];
+            var cqes_buffer: [1 << 8]IoUring.Cqe = undefined;
+            const cqes = cqes_buffer[0..ev.io_uring.copyReadyCqes(&cqes_buffer)];
             if (cqes.len == 0) break;
             for (cqes) |cqe| if (cqe.flags & linux.IORING_CQE_F_SKIP == 0) switch (@as(
                 Completion.Userdata,
