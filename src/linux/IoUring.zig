@@ -12,8 +12,8 @@ const IoUring = @This();
 fd: linux.fd_t = -1,
 sq: SubmissionQueue,
 cq: CompletionQueue,
-flags: u32,
-features: u32,
+flags: SetupFlags,
+features: Features,
 enter_flags: u8 = 0,
 
 /// A friendly way to setup an io_uring, with default linux.io_uring_params.
@@ -21,26 +21,28 @@ enter_flags: u8 = 0,
 /// call on how many entries the submission and completion queues will ultimately have,
 /// see https://github.com/torvalds/linux/blob/v5.8/fs/io_uring.c#L8027-L8050.
 /// Matches the interface of io_uring_queue_init() in liburing.
-pub fn init(entries: u16, flags: u32) !IoUring {
+pub fn init(entries: u16, opt: InitOptions) !IoUring {
     var params = std.mem.zeroInit(linux.io_uring_params, .{
-        .flags = flags | linux.IORING_SETUP_NO_SQARRAY, // default to no sq array
-        .sq_thread_idle = 1000,
+        .flags = @as(u32, @bitCast(opt.flags)),
+        .sq_thread_idle = opt.sq_thread_idle,
     });
-    return IoUring.initParams(entries, &params) catch |err| {
-        if (flags & linux.IORING_SETUP_NO_SQARRAY == 0 and err == error.ArgumentsInvalid) {
-            // fallback with sq array
-            params.flags = flags;
-            return try IoUring.initParams(entries, &params);
+    var self = try IoUring.initParams(entries, &params);
+    errdefer self.deinit();
+
+    if (opt.no_iowait) {
+        if (!self.features.no_iowait) {
+            return error.SystemOutdated;
         }
-        return err;
-    };
+        self.enter_flags |= linuxx.IORING_ENTER_NO_IOWAIT;
+    }
+    return self;
 }
 
 /// A powerful way to setup an io_uring, if you want to tweak linux.io_uring_params such as submission
 /// queue thread cpu affinity or thread idle timeout (the kernel and our default is 1 second).
 /// `params` is passed by reference because the kernel needs to modify the parameters.
 /// Matches the interface of io_uring_queue_init_params() in liburing.
-pub fn initParams(entries: u16, p: *linux.io_uring_params) !IoUring {
+fn initParams(entries: u16, p: *linux.io_uring_params) !IoUring {
     if (entries == 0) return error.EntriesZero;
     if (!std.math.isPowerOfTwo(entries)) return error.EntriesNotPowerOfTwo;
 
@@ -125,8 +127,8 @@ pub fn initParams(entries: u16, p: *linux.io_uring_params) !IoUring {
         .fd = fd,
         .sq = sq,
         .cq = cq,
-        .flags = p.flags,
-        .features = p.features,
+        .flags = @bitCast(p.flags),
+        .features = @bitCast(p.features),
     };
 }
 
@@ -197,9 +199,9 @@ pub fn submit(self: *IoUring, wait: SubmitWait) !u32 {
             return try self.enter(pending_sqes, wait.nr, flags, null);
         }
 
-        if (self.features & linux.IORING_FEAT_EXT_ARG == 0)
+        if (!self.features.ext_arg)
             return error.SystemOutdated;
-        if (wait.min_wait_usec > 0 and (self.features & linuxx.IORING_FEAT_MIN_TIMEOUT == 0))
+        if (wait.min_wait_usec > 0 and (!self.features.min_timeout))
             return error.SystemOutdated;
 
         const arg = std.mem.zeroInit(linuxx.io_uring_getevents_arg, .{
@@ -214,8 +216,7 @@ pub fn submit(self: *IoUring, wait: SubmitWait) !u32 {
 
 fn cq_ring_needs_enter(self: *IoUring) bool {
     // IOPOLL always needs to enter, except if SQPOLL is set as well.
-    return (self.flags & (linux.IORING_SETUP_IOPOLL | linux.IORING_SETUP_SQPOLL) == linux.IORING_SETUP_IOPOLL) or
-        self.cq_ring_needs_flush();
+    return (self.flags.iopoll and !self.flags.sqpoll) or self.cq_ring_needs_flush();
 }
 
 /// Tell the kernel we have submitted SQEs and/or want to wait for CQEs.
@@ -293,7 +294,7 @@ fn flush_sq(self: *IoUring) u32 {
 /// For the latter case, we set the SQ thread wakeup flag.
 /// Matches the implementation of sq_ring_needs_enter() in liburing.
 fn sq_ring_needs_enter(self: *IoUring, flags: *u32) bool {
-    if ((self.flags & linux.IORING_SETUP_SQPOLL) == 0) return true;
+    if (!self.flags.sqpoll) return true;
     if ((@atomicLoad(u32, self.sq.flags, .unordered) & linux.IORING_SQ_NEED_WAKEUP) != 0) {
         flags.* |= linux.IORING_ENTER_SQ_WAKEUP;
         return true;
@@ -390,7 +391,7 @@ fn cq_advance(self: *IoUring, count: u32) void {
 /// entering lower sleep states.
 /// Available since 6.15
 pub fn setIowait(self: *IoUring, enable: bool) !void {
-    if (self.features & linux.IORING_FEAT_NO_IOWAIT == 0) {
+    if (!self.features.no_iowait) {
         return error.SystemOutdated;
     }
     if (enable) {
@@ -588,4 +589,98 @@ pub const CompletionQueue = struct {
         // A no-op since we now share the mmap with the submission queue.
         // Here for symmetry with the submission queue, and for any future feature support.
     }
+};
+
+pub const InitOptions = struct {
+    sq_thread_idle: u32 = 1000,
+    no_iowait: bool = false,
+    flags: SetupFlags = .{
+        .no_sqarray = true,
+    },
+};
+
+pub const SetupFlags = packed struct(u32) {
+    /// io_context is polled
+    iopoll: bool = false,
+
+    /// SQ poll thread
+    sqpoll: bool = false,
+
+    /// sq_thread_cpu is valid
+    sq_aff: bool = false,
+
+    /// app defines CQ size
+    cqsize: bool = false,
+
+    /// clamp SQ/CQ ring sizes
+    clamp: bool = false,
+
+    /// attach to existing wq
+    attach_wq: bool = false,
+
+    /// start with ring disabled
+    _r_disabled: bool = false,
+
+    /// continue submit on error
+    submit_all: bool = false,
+
+    /// Cooperative task running. When requests complete, they often require
+    /// forcing the submitter to transition to the kernel to complete. If this
+    /// flag is set, work will be done when the task transitions anyway, rather
+    /// than force an inter-processor interrupt reschedule. This avoids interrupting
+    /// a task running in userspace, and saves an IPI.
+    coop_taskrun: bool = false,
+
+    /// If COOP_TASKRUN is set, get notified if task work is available for
+    /// running and a kernel transition would be needed to run it. This sets
+    /// IORING_SQ_TASKRUN in the sq ring flags. Not valid with COOP_TASKRUN.
+    taskrun_flag: bool = false,
+
+    /// SQEs are 128 byte
+    _sqe128: bool = false,
+    /// CQEs are 32 byte
+    _cqe32: bool = false,
+
+    /// Only one task is allowed to submit requests
+    single_issuer: bool = false,
+
+    /// Defer running task work to get events.
+    /// Rather than running bits of task work whenever the task transitions
+    /// try to do it just before it is needed.
+    defer_taskrun: bool = false,
+
+    /// Application provides ring memory
+    _no_mmap: bool = false,
+
+    /// Register the ring fd in itself for use with
+    /// IORING_REGISTER_USE_REGISTERED_RING; return a registered fd index rather
+    /// than an fd.
+    _registered_fd_only: bool = false,
+
+    /// Removes indirection through the SQ index array.
+    no_sqarray: bool = true,
+
+    _: u15 = 0,
+};
+
+pub const Features = packed struct(u32) {
+    single_mmap: bool,
+    nodrop: bool,
+    submit_stable: bool,
+    rw_cur_pos: bool,
+    cur_personality: bool,
+    fast_poll: bool,
+    poll_32bits: bool,
+    sqpoll_nonfixed: bool,
+    ext_arg: bool,
+    native_workers: bool,
+    rsrc_tags: bool,
+    cqe_skip: bool,
+    linked_file: bool,
+    reg_reg_ring: bool,
+    recvsend_bundle: bool,
+    min_timeout: bool,
+    rw_attr: bool,
+    no_iowait: bool,
+    _: u14 = 0,
 };

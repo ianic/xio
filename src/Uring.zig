@@ -487,10 +487,12 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .current_context = undefined,
         .ready_queue = null,
         .free_queue = null,
-        .io_uring = try .init(
-            @as(u16, 1) << options.log2_ring_entries,
-            linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER,
-        ),
+        .io_uring = try .init(@as(u16, 1) << options.log2_ring_entries, .{
+            .flags = .{
+                .coop_taskrun = true,
+                .single_issuer = true,
+            },
+        }),
     };
     const main_fiber: *Fiber = @ptrCast(&ev.main_fiber_buffer);
     main_fiber.* = .{
