@@ -2,7 +2,6 @@ const addressFromPosix = Io.Threaded.addressFromPosix;
 const addressToPosix = Io.Threaded.addressToPosix;
 const Alignment = std.mem.Alignment;
 const Allocator = std.mem.Allocator;
-const Argv0 = Io.Threaded.Argv0;
 const assert = std.debug.assert;
 const builtin = @import("builtin");
 const ChdirError = Io.Threaded.ChdirError;
@@ -326,9 +325,9 @@ pub fn io(ev: *Evented) Io {
             .dirStat = dirStat,
             .dirStatFile = dirStatFile,
             .dirAccess = dirAccess, // sync
-            .dirCreateFile = dirCreateFile,
+            .dirCreateFile = dirCreateFile, // if lock flags is used
             .dirCreateFileAtomic = dirCreateFileAtomic,
-            .dirOpenFile = dirOpenFile,
+            .dirOpenFile = dirOpenFile, // if lock flags is used
             .dirClose = dirClose,
             .dirRead = dirRead,
             .dirRealPath = dirRealPath, // sync
@@ -360,14 +359,14 @@ pub fn io(ev: *Evented) Io {
             .fileEnableAnsiEscapeCodes = fileEnableAnsiEscapeCodes,
             .fileSupportsAnsiEscapeCodes = fileIsTty,
             .fileSetLength = fileSetLength,
-            .fileSetOwner = fileSetOwner,
-            .fileSetPermissions = fileSetPermissions,
-            .fileSetTimestamps = fileSetTimestamps,
-            .fileLock = fileLock,
-            .fileTryLock = fileTryLock,
-            .fileUnlock = fileUnlock,
-            .fileDowngradeLock = fileDowngradeLock,
-            .fileRealPath = fileRealPath,
+            .fileSetOwner = fileSetOwner, // sync
+            .fileSetPermissions = fileSetPermissions, // sync
+            .fileSetTimestamps = fileSetTimestamps, // sync
+            .fileLock = fileLock, // sync
+            .fileTryLock = fileTryLock, // sync
+            .fileUnlock = fileUnlock, // sync
+            .fileDowngradeLock = fileDowngradeLock, // sync
+            .fileRealPath = fileRealPath, // sync
             .fileHardLink = fileHardLink,
 
             .fileMemoryMapCreate = fileMemoryMapCreate,
@@ -420,15 +419,8 @@ pub fn io(ev: *Evented) Io {
 }
 
 pub const InitOptions = struct {
-    /// Maximum thread pool size (excluding the main thread).
-    /// Defaults to one less than the number of logical CPU cores.
-    thread_limit: ?usize = 0,
-
     log2_ring_entries: u4 = 10,
 
-    /// Affects the following operations:
-    /// * `processExecutablePath` on OpenBSD and Haiku.
-    argv0: Argv0 = .empty,
     /// Affects the following operations:
     /// * `fileIsTty`
     /// * `processSpawn`, `processSpawnPath`, `processReplace`, `processReplacePath`
@@ -508,12 +500,18 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
 pub fn deinit(ev: *Evented) void {
     const main_fiber: *Fiber = @ptrCast(&ev.main_fiber_buffer);
     assert(ev.currentFiber() == main_fiber);
-    assert(ev.ready_queue == null or ev.ready_queue == Fiber.finished); // pending async
-    var next_fiber = ev.free_queue;
+
+    var next_fiber = ev.ready_queue;
+    while (next_fiber) |free_fiber| {
+        next_fiber = free_fiber.status.queue_next;
+        ev.backing_allocator.free(free_fiber.allocatedSlice());
+    }
+    next_fiber = ev.free_queue;
     while (next_fiber) |free_fiber| {
         next_fiber = free_fiber.status.free_next;
         ev.backing_allocator.free(free_fiber.allocatedSlice());
     }
+
     ev.io_uring.deinit();
     ev.backing_allocator.free(ev.allocated_slice);
     ev.* = undefined;
