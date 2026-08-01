@@ -212,10 +212,7 @@ const Fiber = struct {
 
     fn complete(f: *Fiber, c: Completion) void {
         f.resultPointer(Completion).* = c;
-        // TODO: what about group
-        if (f.cancel_status.awaiting != .group) {
-            _ = f.cancel_status.changeAwaiting(.operation, .nothing);
-        }
+        _ = f.cancel_status.changeAwaiting(.operation, .nothing);
     }
     fn completion(f: *Fiber) Completion {
         return f.resultPointer(Completion).*;
