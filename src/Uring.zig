@@ -581,6 +581,7 @@ fn yield(ev: *Evented, maybe_ready_fiber: ?*Fiber, pending_task: SwitchMessage.P
         &ready_fiber.context
     else
         &ev.idle_context;
+
     const message: SwitchMessage = .{
         .contexts = .{
             .old = ev.current_context,
@@ -998,20 +999,6 @@ const Group = struct {
         return @ptrCast(&group.ptr.token);
     }
 
-    const Mutex = packed struct(u32) {
-        locked: bool,
-        contended: bool,
-        shared2: u30,
-    };
-    fn mutexPtr(group: Group) *Mutex {
-        return switch (comptime builtin.cpu.arch.endian()) {
-            .little => @ptrCast(&group.ptr.state),
-            .big => @ptrCast(@alignCast(
-                @as([*]u8, @ptrCast(&group.ptr.state)) + @sizeOf(usize) - @sizeOf(u32),
-            )),
-        };
-    }
-
     const Awaiter = packed struct(usize) {
         locked: bool,
         contended: bool,
@@ -1021,117 +1008,66 @@ const Group = struct {
         return @ptrCast(&group.ptr.state);
     }
 
-    fn lock(group: Group, ev: *Evented) void {
-        const mutex = group.mutexPtr();
-        {
-            const old_state = @atomicRmw(
-                Mutex,
-                mutex,
-                .Or,
-                .{ .locked = true, .contended = false, .shared2 = 0 },
-                .acquire,
-            );
-            if (!old_state.locked) {
-                @branchHint(.likely);
-                return;
-            }
-            if (old_state.contended) {
-                futexWaitUncancelable(ev, @ptrCast(mutex), @bitCast(old_state));
-            }
-        }
-        while (true) {
-            var old_state = @atomicRmw(
-                Mutex,
-                mutex,
-                .Or,
-                .{ .locked = true, .contended = true, .shared2 = 0 },
-                .acquire,
-            );
-            if (!old_state.locked) {
-                @branchHint(.likely);
-                return;
-            }
-            old_state.contended = true;
-            futexWaitUncancelable(ev, @ptrCast(mutex), @bitCast(old_state));
-        }
-    }
-
-    fn unlock(group: Group, ev: *Evented) void {
-        const mutex = group.mutexPtr();
-        const old_state = @atomicRmw(
-            Mutex,
-            mutex,
-            .And,
-            .{ .locked = false, .contended = false, .shared2 = std.math.maxInt(u30) },
-            .release,
-        );
-        assert(old_state.locked);
-        if (old_state.contended) futexWake(ev, @ptrCast(mutex), 1);
-    }
-
-    fn addFiber(group: Group, ev: *Evented, fiber: *Fiber) void {
-        group.lock(ev);
-        defer group.unlock(ev);
-        const list_ptr = group.listPtr();
-        const list = @atomicLoad(List, list_ptr, .monotonic);
+    fn addFiber(group: Group, fiber: *Fiber) void {
+        const ptr = group.listPtr();
+        const list = ptr.*;
         if (list.cancel_requested) fiber.cancel_status = .{ .requested = true, .awaiting = .nothing };
         const old_head = list.fibers.unpack();
         if (old_head) |head| head.link.group.prev = fiber;
         fiber.link.group.next = old_head;
-        @atomicStore(List, list_ptr, .{
+        ptr.* = .{
             .cancel_requested = list.cancel_requested,
             .awaiter_delayed = list.awaiter_delayed,
             .fibers = .pack(fiber),
-        }, .monotonic);
+        };
     }
 
-    fn removeFiber(group: Group, ev: *Evented, fiber: *Fiber) ?*Fiber {
-        group.lock(ev);
-        defer group.unlock(ev);
-        const list_ptr = group.listPtr();
-        const list = @atomicLoad(List, list_ptr, .monotonic);
+    fn removeFiber(group: Group, fiber: *Fiber) ?*Fiber {
+        const ptr = group.listPtr();
+        const list = ptr.*;
         if (fiber.link.group.next) |next| next.link.group.prev = fiber.link.group.prev;
         if (fiber.link.group.prev) |prev| {
             prev.link.group.next = fiber.link.group.next;
         } else if (fiber.link.group.next) |new_head| {
-            @atomicStore(List, list_ptr, .{
+            ptr.* = .{
                 .cancel_requested = list.cancel_requested,
                 .awaiter_delayed = list.awaiter_delayed,
                 .fibers = .pack(new_head),
-            }, .monotonic);
-        } else if (@atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).awaiter.unpack()) |awaiter| {
+            };
+        } else if (group.awaiterPtr().*.awaiter.unpack()) |awaiter| {
             if (!awaiter.cancel_status.changeAwaiting(.group, .nothing) or list.cancel_requested) {
-                @atomicStore(List, list_ptr, .{
+                ptr.* = .{
                     .cancel_requested = false,
                     .awaiter_delayed = false,
                     .fibers = .null,
-                }, .release);
+                };
                 assert(awaiter.status.awaiting_group.ptr == group.ptr);
                 awaiter.status = .{ .queue_next = null };
                 return awaiter;
             }
-            // Race with `Fiber.requestCancel`
-            @atomicStore(List, list_ptr, .{
+            ptr.* = .{
                 .cancel_requested = false,
                 .awaiter_delayed = true,
                 .fibers = .null,
-            }, .monotonic);
-        } else @atomicStore(List, list_ptr, .{
-            .cancel_requested = false,
-            .awaiter_delayed = false,
-            .fibers = .null,
-        }, .release);
+            };
+        } else {
+            ptr.* = .{
+                .cancel_requested = false,
+                .awaiter_delayed = false,
+                .fibers = .null,
+            };
+        }
         return null;
     }
 
     fn await(group: Group, ev: *Evented, awaiter: *Fiber) bool {
-        group.lock(ev);
-        defer group.unlock(ev);
-        if (@atomicLoad(List, group.listPtr(), .monotonic).fibers.unpack()) |_| {
+        const ptr = group.listPtr();
+        const list = ptr.*;
+        if (list.fibers.unpack()) |_| {
             if (group.registerAwaiter(awaiter) and awaiter.cancel_protection.check() == .unblocked) {
                 // The awaiter already had an unacknowledged cancelation request before
                 // attempting to await a group, so propagate the cancelation to the group.
-                assert(!group.cancelLocked(ev, null));
+                assert(!group.cancel(ev, null));
             }
             return false;
         }
@@ -1139,22 +1075,14 @@ const Group = struct {
     }
 
     fn cancel(group: Group, ev: *Evented, maybe_awaiter: ?*Fiber) bool {
-        group.lock(ev);
-        defer group.unlock(ev);
-        return group.cancelLocked(ev, maybe_awaiter);
-    }
-
-    /// Assumes the mutex is held.
-    fn cancelLocked(group: Group, ev: *Evented, maybe_awaiter: ?*Fiber) bool {
-        const list_ptr = group.listPtr();
-        const list = @atomicRmw(
-            List,
-            list_ptr,
-            .Add,
-            .{ .cancel_requested = true, .awaiter_delayed = false, .fibers = .null },
-            .monotonic,
-        );
+        const ptr = group.listPtr();
+        const list = ptr.*;
         assert(!list.cancel_requested);
+        ptr.* = .{
+            .cancel_requested = true,
+            .awaiter_delayed = false,
+            .fibers = list.fibers,
+        };
         if (list.fibers.unpack()) |head| {
             var maybe_fiber: ?*Fiber = head;
             while (maybe_fiber) |fiber| {
@@ -1164,26 +1092,24 @@ const Group = struct {
             if (maybe_awaiter) |awaiter| _ = group.registerAwaiter(awaiter);
             return false;
         }
-        @atomicStore(
-            List,
-            list_ptr,
-            .{ .cancel_requested = false, .awaiter_delayed = false, .fibers = .null },
-            .release,
-        );
+        ptr.* = .{
+            .cancel_requested = false,
+            .awaiter_delayed = false,
+            .fibers = .null,
+        };
         return if (maybe_awaiter) |_| true else list.awaiter_delayed;
     }
 
-    /// Assumes the mutex is held.
     fn registerAwaiter(group: Group, awaiter: *Fiber) bool {
         assert(awaiter.status.queue_next == null);
         awaiter.status = .{ .awaiting_group = group };
-        assert(@atomicRmw(
-            Awaiter,
-            group.awaiterPtr(),
-            .Add,
-            .{ .locked = false, .contended = false, .awaiter = .pack(awaiter) },
-            .monotonic,
-        ).awaiter == .null);
+        const ptr = group.awaiterPtr();
+        assert(ptr.awaiter == .null);
+        ptr.* = .{
+            .locked = ptr.locked,
+            .contended = ptr.contended,
+            .awaiter = .pack(awaiter),
+        };
         return awaiter.cancel_status.changeAwaiting(.nothing, .group);
     }
 
@@ -1239,7 +1165,7 @@ const Group = struct {
             message.handle(ev);
             assert(fiber.status.queue_next == null);
             closure.start(closure.contextPointer());
-            ev.yield(closure.group.removeFiber(ev, fiber), .destroy);
+            ev.yield(closure.group.removeFiber(fiber), .destroy);
             unreachable; // switched to dead fiber
         }
     };
@@ -1307,7 +1233,7 @@ fn groupConcurrent(
         .start = start,
     };
     @memcpy(closure.contextPointer(), context);
-    group.addFiber(ev, fiber);
+    group.addFiber(fiber);
     ev.schedule(.{ .head = fiber, .tail = fiber });
 }
 
