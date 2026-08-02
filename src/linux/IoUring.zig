@@ -189,7 +189,7 @@ pub fn submit(self: *IoUring, wait: SubmitWait) !u32 {
     const pending_sqes = self.flush_sq();
     var flags: EnterFlags = self.enter_flags;
     const cq_needs_enter = wait.nr > 0 or self.cq_ring_needs_enter();
-    if (cq_needs_enter or self.sq_ring_needs_enter(&flags)) {
+    if (self.sq_ring_needs_enter(&flags) or cq_needs_enter) {
         flags.getevents = cq_needs_enter;
 
         if (wait.nr == 0 or (wait.timeout == null and wait.min_wait_usec == 0)) {
