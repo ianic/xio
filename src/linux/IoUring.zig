@@ -21,6 +21,8 @@ enter_flags: EnterFlags = .{},
 /// see https://github.com/torvalds/linux/blob/v5.8/fs/io_uring.c#L8027-L8050.
 /// Matches the interface of io_uring_queue_init() in liburing.
 pub fn init(entries: u16, opt: InitOptions) !IoUring {
+    if (!opt.flags.valid()) return error.UnsupportedFlags;
+
     var params = std.mem.zeroInit(linux.io_uring_params, .{
         .flags = @as(u32, @bitCast(opt.flags)),
         .sq_thread_idle = opt.sq_thread_idle,
@@ -44,12 +46,6 @@ pub fn init(entries: u16, opt: InitOptions) !IoUring {
 fn initParams(entries: u16, p: *linux.io_uring_params) !IoUring {
     if (entries == 0) return error.EntriesZero;
     if (!std.math.isPowerOfTwo(entries)) return error.EntriesNotPowerOfTwo;
-
-    const unsupported_flags = linux.IORING_SETUP_CQE32 |
-        linux.IORING_SETUP_SQE128 |
-        linux.IORING_SETUP_NO_MMAP |
-        linux.IORING_SETUP_REGISTERED_FD_ONLY;
-    if (p.flags & unsupported_flags > 0) return error.UnsupportedFlags;
 
     assert(p.sq_entries == 0);
     assert(p.cq_entries == 0 or p.flags & linux.IORING_SETUP_CQSIZE != 0);
@@ -186,14 +182,22 @@ pub const SubmitWait = struct {
 /// Returns error.TimeoutExpired if no completions are posted until `wait_timeout`.
 /// Returns the number of SQEs submitted, if not used alongside IORING_SETUP_SQPOLL.
 pub fn submit(self: *IoUring, wait: SubmitWait) !u32 {
-    const pending_sqes = self.flush_sq();
-    var flags: EnterFlags = self.enter_flags;
-    const cq_needs_enter = wait.nr > 0 or self.cq_ring_needs_enter();
-    if (self.sq_ring_needs_enter(&flags) or cq_needs_enter) {
-        flags.getevents = cq_needs_enter;
+    const pending_sqes = self.sq.flush();
+    const sq_flags = @atomicLoad(SubmissionQueue.Flags, self.sq.flags, .unordered);
 
-        if (wait.nr == 0 or (wait.timeout == null and wait.min_wait_usec == 0)) {
-            return try self.enter(pending_sqes, wait.nr, &flags, null);
+    const enter_flags: EnterFlags = .{
+        .no_iowait = self.enter_flags.no_iowait,
+        .sq_wakeup = self.flags.sqpoll and sq_flags.need_wakeup,
+        .getevents = wait.nr > 0 or
+            (self.flags.iopoll and !self.flags.sqpoll) or
+            sq_flags.cq_overflow or
+            sq_flags.taskrun,
+        .ext_arg = !(wait.nr == 0 or (wait.timeout == null and wait.min_wait_usec == 0)),
+    };
+
+    if (!self.flags.sqpoll or enter_flags.getevents or enter_flags.sq_wakeup) {
+        if (!enter_flags.ext_arg) {
+            return try self.enter(pending_sqes, wait.nr, enter_flags, null);
         }
 
         if (!self.features.ext_arg)
@@ -206,33 +210,9 @@ pub fn submit(self: *IoUring, wait: SubmitWait) !u32 {
             .ts = @intFromPtr(wait.timeout),
             .min_wait_usec = wait.min_wait_usec,
         });
-        return try self.enter(pending_sqes, wait.nr, &flags, &arg);
+        return try self.enter(pending_sqes, wait.nr, enter_flags, &arg);
     }
     return pending_sqes;
-}
-
-fn cq_ring_needs_enter(self: *IoUring) bool {
-    // IOPOLL always needs to enter, except if SQPOLL is set as well.
-    return (self.flags.iopoll and !self.flags.sqpoll) or self.cq_ring_needs_flush();
-}
-
-/// Matches the implementation of cq_ring_needs_flush() in liburing.
-fn cq_ring_needs_flush(self: *IoUring) bool {
-    return (@atomicLoad(u32, self.sq.flags, .unordered) &
-        (linux.IORING_SQ_CQ_OVERFLOW | linux.IORING_SQ_TASKRUN)) != 0;
-}
-
-/// Returns true if we are not using an SQ thread (thus nobody submits but us),
-/// or if IORING_SQ_NEED_WAKEUP is set and the SQ thread must be explicitly awakened.
-/// For the latter case, we set the SQ thread wakeup flag.
-/// Matches the implementation of sq_ring_needs_enter() in liburing.
-fn sq_ring_needs_enter(self: *IoUring, flags: *EnterFlags) bool {
-    if (!self.flags.sqpoll) return true;
-    if ((@atomicLoad(u32, self.sq.flags, .unordered) & linux.IORING_SQ_NEED_WAKEUP) != 0) {
-        flags.sq_wakeup = true;
-        return true;
-    }
-    return false;
 }
 
 /// Tell the kernel we have submitted SQEs and/or want to wait for CQEs.
@@ -241,16 +221,15 @@ fn enter(
     self: *IoUring,
     to_submit: u32,
     min_complete: u32,
-    flags: *EnterFlags,
+    flags: EnterFlags,
     arg: ?*const io_uring_getevents_arg,
 ) !u32 {
     assert(self.fd >= 0);
-    flags.ext_arg = arg != null;
     const res = io_uring_enter(
         self.fd,
         to_submit,
         min_complete,
-        @as(u8, @bitCast(flags.*)),
+        @as(u8, @bitCast(flags)),
         arg,
         if (arg != null) @sizeOf(io_uring_getevents_arg) else linux.NSIG / 8,
     );
@@ -289,33 +268,6 @@ fn enter(
         else => |errno| return posix.unexpectedErrno(errno),
     }
     return @as(u32, @intCast(res));
-}
-
-fn io_uring_enter(fd: linux.fd_t, to_submit: u32, min_complete: u32, flags: u32, arg: ?*const anyopaque, sz: u32) usize {
-    return linux.syscall6(.io_uring_enter, @as(u32, @bitCast(fd)), to_submit, min_complete, flags, @intFromPtr(arg), sz);
-}
-
-const io_uring_getevents_arg = extern struct {
-    sigmask: u64,
-    sigmask_sz: u32,
-    min_wait_usec: u32,
-    ts: u64,
-};
-
-/// Sync internal state with kernel ring state on the SQ side.
-/// Returns the number of all pending events in the SQ ring, for the shared ring.
-/// This return value includes previously flushed SQEs, as per liburing.
-/// The rationale is to suggest that an io_uring_enter() call is needed rather than not.
-/// Matches the implementation of __io_uring_flush_sq() in liburing.
-fn flush_sq(self: *IoUring) u32 {
-    if (self.sq.sqe_head != self.sq.sqe_tail) {
-        const tail = self.sq.sqe_tail;
-        self.sq.sqe_head = tail;
-        // Ensure that the kernel can actually see the SQE updates when it sees the tail update.
-        @atomicStore(u32, self.sq.tail, tail, .release);
-    }
-    // sq_ready
-    return self.sq.sqe_tail -% @atomicLoad(u32, self.sq.head, .acquire);
 }
 
 /// Copies as many CQEs as are ready, and that can fit into the destination `cqes` slice.
@@ -368,7 +320,7 @@ pub fn resize(self: *IoUring, sq_entries: u32, cq_entries: u32) !void {
 /// Matches the interface of io_uring_resize_rings() in liburing.
 fn resizeParams(self: *IoUring, p: *linux.io_uring_params) !void {
     // Need to sync internal state before resize
-    _ = self.flush_sq();
+    _ = self.sq.flush();
     // Register rings resize
     p.features |= linux.IORING_FEAT_SINGLE_MMAP; // asserted in SubmissionQueue.init
     const res = linux.io_uring_register(self.fd, .REGISTER_RESIZE_RINGS, p, 1);
@@ -406,10 +358,20 @@ fn resizeParams(self: *IoUring, p: *linux.io_uring_params) !void {
 pub const SubmissionQueue = struct {
     const page_align = std.heap.page_size_min;
 
+    const Flags = packed struct(u32) {
+        /// needs io_uring_enter wakeup
+        need_wakeup: bool,
+        /// kernel has cqes waiting beyond the cq ring
+        cq_overflow: bool,
+        /// task should enter the kernel
+        taskrun: bool,
+        _: u29,
+    };
+
     head: *u32,
     tail: *u32,
     mask: u32,
-    flags: *u32,
+    flags: *Flags,
     dropped: *u32,
     array: []u32,
     sqes: []Sqe,
@@ -479,6 +441,22 @@ pub const SubmissionQueue = struct {
             .mmap = mmap,
             .mmap_sqes = mmap_sqes,
         };
+    }
+
+    /// Sync internal state with kernel ring state on the SQ side.
+    /// Returns the number of all pending events in the SQ ring, for the shared ring.
+    /// This return value includes previously flushed SQEs, as per liburing.
+    /// The rationale is to suggest that an io_uring_enter() call is needed rather than not.
+    /// Matches the implementation of __io_uring_flush_sq() in liburing.
+    fn flush(self: *SubmissionQueue) u32 {
+        if (self.sqe_head != self.sqe_tail) {
+            const tail = self.sqe_tail;
+            self.sqe_head = tail;
+            // Ensure that the kernel can actually see the SQE updates when it sees the tail update.
+            @atomicStore(u32, self.tail, tail, .release);
+        }
+        // sq_ready
+        return self.sqe_tail -% @atomicLoad(u32, self.head, .acquire);
     }
 
     pub fn deinit(self: *SubmissionQueue) void {
@@ -602,6 +580,10 @@ pub const SetupFlags = packed struct(u32) {
     no_sqarray: bool = true,
 
     _: u15 = 0,
+
+    fn valid(f: SetupFlags) bool {
+        return !(f._cqe32 or f._no_mmap or f._r_disabled or f._registered_fd_only or f._sqe128 or f._ > 0);
+    }
 };
 
 pub const Features = packed struct(u32) {
@@ -635,4 +617,17 @@ pub const EnterFlags = packed struct(u8) {
     abs_timer: bool = false,
     ext_arg_reg: bool = false,
     no_iowait: bool = false,
+};
+
+// override of the std.os.linux variant
+fn io_uring_enter(fd: linux.fd_t, to_submit: u32, min_complete: u32, flags: u32, arg: ?*const anyopaque, sz: u32) usize {
+    return linux.syscall6(.io_uring_enter, @as(u32, @bitCast(fd)), to_submit, min_complete, flags, @intFromPtr(arg), sz);
+}
+
+// missing in std.os.linux
+const io_uring_getevents_arg = extern struct {
+    sigmask: u64,
+    sigmask_sz: u32,
+    min_wait_usec: u32,
+    ts: u64,
 };
