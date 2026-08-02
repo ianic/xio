@@ -304,26 +304,25 @@ pub fn copyReadyCqes(self: *IoUring, cqes: []Cqe) u32 {
 pub fn resize(self: *IoUring, sq_entries: u32, cq_entries: u32) !void {
     if (sq_entries == 0) return error.EntriesZero;
     if (!std.math.isPowerOfTwo(sq_entries)) return error.EntriesNotPowerOfTwo;
-    var flags: u32 = linux.IORING_SETUP_CLAMP;
+
+    var flags: SetupFlags = @bitCast(@as(u32, 0));
+    flags.clamp = true;
     if (cq_entries > 0) {
         if (!std.math.isPowerOfTwo(cq_entries)) return error.EntriesNotPowerOfTwo;
-        flags |= linux.IORING_SETUP_CQSIZE;
+        flags.cqsize = true;
     }
     var p = std.mem.zeroInit(linux.io_uring_params, .{
         .sq_entries = sq_entries,
         .cq_entries = cq_entries,
-        .flags = flags,
+        .features = linux.IORING_FEAT_SINGLE_MMAP, // asserted in SubmissionQueue.init
+        .flags = @as(u32, @bitCast(flags)),
     });
-    try resizeParams(self, &p);
-}
 
-/// Matches the interface of io_uring_resize_rings() in liburing.
-fn resizeParams(self: *IoUring, p: *linux.io_uring_params) !void {
     // Need to sync internal state before resize
     _ = self.sq.flush();
+
     // Register rings resize
-    p.features |= linux.IORING_FEAT_SINGLE_MMAP; // asserted in SubmissionQueue.init
-    const res = linux.io_uring_register(self.fd, .REGISTER_RESIZE_RINGS, p, 1);
+    const res = linux.io_uring_register(self.fd, .REGISTER_RESIZE_RINGS, &p, 1);
     switch (linux.errno(res)) {
         .SUCCESS => {},
         // Attempting to resize a ring setup with IORING_SETUP_SINGLE_ISSUER and
@@ -341,9 +340,9 @@ fn resizeParams(self: *IoUring, p: *linux.io_uring_params) !void {
         else => |ern| return posix.unexpectedErrno(ern),
     }
     // Create new submission and completion queues
-    var sq = try SubmissionQueue.init(self.fd, p.*);
+    var sq = try SubmissionQueue.init(self.fd, p);
     errdefer sq.deinit();
-    var cq = try CompletionQueue.init(self.fd, p.*, sq);
+    var cq = try CompletionQueue.init(self.fd, p, sq);
     errdefer cq.deinit();
     // Copy pointers from previous submission queue
     sq.sqe_head = self.sq.sqe_head;
