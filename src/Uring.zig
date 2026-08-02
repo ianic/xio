@@ -478,9 +478,8 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .free_queue = null,
         .io_uring = try .init(@as(u16, 1) << options.log2_ring_entries, .{
             .flags = .{
-                .coop_taskrun = true,
                 .single_issuer = true,
-                .taskrun_flag = true,
+                .coop_taskrun = true,
                 .defer_taskrun = true, // needed for resize
             },
         }),

@@ -496,3 +496,18 @@ test "group" {
         try testing.expectEqual(error.Canceled, task3.err.?);
     }
 }
+
+test "dns" {
+    const gpa = testing.allocator;
+    var uring: Uring = undefined;
+    try uring.init(gpa, .{ .log2_ring_entries = 1 });
+    defer uring.deinit();
+    const io = uring.io();
+
+    const host = "google.com";
+    const host_name = try std.Io.net.HostName.init(host);
+    _ = host_name.connect(io, 80, .{ .mode = .stream }) catch |err| switch (err) {
+        error.NetworkDown => .{},
+        else => |e| return e,
+    };
+}
