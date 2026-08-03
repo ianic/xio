@@ -4,14 +4,14 @@ const mem = std.mem;
 const log = std.log.scoped(.main);
 const assert = std.debug.assert;
 const testing = std.testing;
-const Uring = @import("Uring.zig");
+const Evented = @import("Evented.zig");
 
 test "tcp" {
     const gpa = testing.allocator;
 
-    var uring: Uring = undefined;
-    try uring.init(gpa, .{});
-    defer uring.deinit();
+    var evented: Evented = undefined;
+    try evented.init(gpa, .{});
+    defer evented.deinit();
 
     var threaded = Io.Threaded.init(gpa, .{
         .async_limit = .limited(2),
@@ -20,7 +20,7 @@ test "tcp" {
     defer threaded.deinit();
 
     for (0..2) |_| {
-        for ([_]Io{ threaded.io(), uring.io() }) |io| {
+        for ([_]Io{ threaded.io(), evented.io() }) |io| {
             var addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
             var server = try addr.listen(io, .{ .reuse_address = true });
             addr = server.socket.address;
@@ -151,10 +151,10 @@ test "sendfile" {
 
     // Init Io.Uring
     const gpa = testing.allocator;
-    var uring: Uring = undefined;
-    try uring.init(gpa, .{});
-    defer uring.deinit();
-    const io = uring.io();
+    var evented: Evented = undefined;
+    try evented.init(gpa, .{});
+    defer evented.deinit();
+    const io = evented.io();
 
     _ = try file.length(io);
 
@@ -187,10 +187,10 @@ test "some file operations" {
     defer tmp.cleanup();
     const dir = tmp.dir;
 
-    var uring: Uring = undefined;
-    try uring.init(gpa, .{});
-    defer uring.deinit();
-    const io = uring.io();
+    var evented: Evented = undefined;
+    try evented.init(gpa, .{});
+    defer evented.deinit();
+    const io = evented.io();
 
     {
         try dir.createDir(io, "folder1", .default_dir);
@@ -269,10 +269,10 @@ test "some dir operations" {
     const dir = tmp.dir;
 
     const gpa = testing.allocator;
-    var uring: Uring = undefined;
-    try uring.init(gpa, .{});
-    defer uring.deinit();
-    const io = uring.io();
+    var evented: Evented = undefined;
+    try evented.init(gpa, .{});
+    defer evented.deinit();
+    const io = evented.io();
 
     var file = try dir.createFile(io, "pero", .{});
     defer file.close(io);
@@ -333,10 +333,10 @@ test "batch" {
     // defer threaded.deinit();
     // const io = threaded.io();
 
-    var uring: Uring = undefined;
-    try uring.init(gpa, .{});
-    defer uring.deinit();
-    const io = uring.io();
+    var evented: Evented = undefined;
+    try evented.init(gpa, .{});
+    defer evented.deinit();
+    const io = evented.io();
 
     // Start server on os assigned port
     var addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -356,10 +356,10 @@ test "batch" {
 
 test "random" {
     const gpa = testing.allocator;
-    var uring: Uring = undefined;
-    try uring.init(gpa, .{});
-    defer uring.deinit();
-    const io = uring.io();
+    var evented: Evented = undefined;
+    try evented.init(gpa, .{});
+    defer evented.deinit();
+    const io = evented.io();
 
     var buffer: [1024]u8 = @splat(0xff);
     io.random(&buffer);
@@ -378,17 +378,17 @@ test "random" {
 test "panic" {
     if (true) return error.SkipZigTest;
     const gpa = testing.allocator;
-    var uring: Uring = undefined;
-    try uring.init(gpa, .{});
-    defer uring.deinit();
-    const io = uring.io();
+    var evented: Evented = undefined;
+    try evented.init(gpa, .{});
+    defer evented.deinit();
+    const io = evented.io();
 
     var addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try addr.listen(io, .{ .reuse_address = true });
     addr = server.socket.address;
     var f = io.async(Io.net.Server.accept, .{ &server, io });
     try io.sleep(.fromMilliseconds(1), .real);
-    _ = std.os.linux.close(uring.io_uring.fd);
+    _ = std.os.linux.close(evented.io_uring.fd);
 
     const conn = try f.await(io);
     //const conn = try server.accept(io);
@@ -397,22 +397,22 @@ test "panic" {
 
 test "resize" {
     const gpa = testing.allocator;
-    var uring: Uring = undefined;
-    try uring.init(gpa, .{ .log2_ring_entries = 1 });
-    defer uring.deinit();
-    const io = uring.io();
+    var evented: Evented = undefined;
+    try evented.init(gpa, .{ .log2_ring_entries = 1 });
+    defer evented.deinit();
+    const io = evented.io();
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = tmp.dir;
 
-    try testing.expectEqual(2, uring.io_uring.sq.sqes.len);
+    try testing.expectEqual(2, evented.io_uring.sq.sqes.len);
 
     var f1 = io.async(Io.Dir.createFile, .{ dir, io, "file1", Io.Dir.CreateFileOptions{} });
     var f2 = io.async(Io.Dir.createFile, .{ dir, io, "file2", Io.Dir.CreateFileOptions{} });
     var f3 = io.async(Io.Dir.createFile, .{ dir, io, "file3", Io.Dir.CreateFileOptions{} });
     _ = try f1.await(io);
-    try testing.expectEqual(4, uring.io_uring.sq.sqes.len);
+    try testing.expectEqual(4, evented.io_uring.sq.sqes.len);
     _ = try f2.await(io);
     _ = try f3.await(io);
 }
@@ -433,10 +433,10 @@ test "group" {
     };
 
     const gpa = testing.allocator;
-    var uring: Uring = undefined;
-    try uring.init(gpa, .{});
-    defer uring.deinit();
-    const io = uring.io();
+    var evented: Evented = undefined;
+    try evented.init(gpa, .{});
+    defer evented.deinit();
+    const io = evented.io();
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -465,19 +465,19 @@ test "group" {
         var task3: Task = .{};
 
         var grp = Io.Group.init;
-        try testing.expect(uring.ready_queue == null);
+        try testing.expect(evented.ready_queue == null);
         grp.async(io, Task.createFile, .{ &task1, io, dir, ".." });
-        try testing.expect(uring.ready_queue != null);
-        const fiber1 = uring.ready_queue.?;
+        try testing.expect(evented.ready_queue != null);
+        const fiber1 = evented.ready_queue.?;
         try testing.expect(fiber1.link.group.next == null);
 
         grp.async(io, Task.createFile, .{ &task2, io, dir, "file2" });
-        const fiber2 = uring.ready_queue.?;
+        const fiber2 = evented.ready_queue.?;
         try testing.expect(fiber2.link.group.next != null);
         try testing.expect(fiber2.link.group.next.? == fiber1);
 
         grp.async(io, Task.createFile, .{ &task3, io, dir, "file3" });
-        const fiber3 = uring.ready_queue.?;
+        const fiber3 = evented.ready_queue.?;
         try testing.expect(fiber3.link.group.next != null);
         try testing.expect(fiber3.link.group.next.? == fiber2);
 
@@ -499,10 +499,10 @@ test "group" {
 
 test "dns" {
     const gpa = testing.allocator;
-    var uring: Uring = undefined;
-    try uring.init(gpa, .{ .log2_ring_entries = 1 });
-    defer uring.deinit();
-    const io = uring.io();
+    var evented: Evented = undefined;
+    try evented.init(gpa, .{ .log2_ring_entries = 1 });
+    defer evented.deinit();
+    const io = evented.io();
 
     const host = "google.com";
     const host_name = try std.Io.net.HostName.init(host);
