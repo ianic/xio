@@ -12,11 +12,12 @@ pub fn build(b: *std.Build) void {
     inline for ([_][]const u8{
         "client",
         "server",
+        "dns",
     }) |name| {
         const bin = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
-                .root_source_file = b.path("src/" ++ name ++ ".zig"),
+                .root_source_file = b.path("bin/" ++ name ++ ".zig"),
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
