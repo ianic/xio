@@ -499,10 +499,10 @@ test "group" {
 
 test "dns" {
     const gpa = testing.allocator;
-    var evented: Evented = undefined;
-    try evented.init(gpa, .{ .log2_ring_entries = 1 });
-    defer evented.deinit();
-    const io = evented.io();
+    var ev: Evented = undefined;
+    try ev.init(gpa, .{});
+    defer ev.deinit();
+    const io = ev.io();
 
     const host = "google.com";
     const host_name = try std.Io.net.HostName.init(host);
@@ -510,4 +510,302 @@ test "dns" {
         error.NetworkDown => .{},
         else => |e| return e,
     };
+}
+
+test "dns io" {
+    const gpa = testing.allocator;
+    var ev: Evented = undefined;
+    try ev.init(gpa, .{});
+    defer ev.deinit();
+    const io = ev.io();
+
+    const host = "google.com";
+    const host_name = try std.Io.net.HostName.init(host);
+    _ = host_name.connect(io, 80, .{ .mode = .stream }) catch |err| switch (err) {
+        error.NetworkDown => .{},
+        else => |e| return e,
+    };
+}
+
+const Header = packed struct {
+    transaction_id: u16 = 0,
+    flags: Flags = .{},
+    query_count: u16,
+    answer_count: u16 = 0,
+    record_count: u16 = 0,
+    additional_count: u16 = 0,
+};
+
+const Flags = packed struct {
+    qr: u1 = 0, // query = 1, response = 2
+    opcode: u4 = 0,
+    aa: u1 = 0,
+    tc: u1 = 0,
+    rd: u1 = 0,
+    ra: u1 = 0,
+    z: u1 = 0,
+    ad: u1 = 0,
+    cd: u1 = 0,
+    rcode: u4 = 0,
+};
+
+const udp_payload_size = 1472;
+
+fn query(buf: []u8, transaction_id: u16, name: []const u8) ![]u8 {
+    assert(buf.len >= 256);
+
+    var w = Io.Writer.fixed(buf);
+    try w.writeInt(u16, transaction_id, .big);
+    try w.writeStruct(Flags{ .ra = 1 }, .big);
+    try w.writeInt(u16, 1, .big);
+    try w.writeInt(u16, 0, .big);
+    try w.writeInt(u16, 0, .big);
+    try w.writeInt(u16, 1, .big);
+
+    var pos: usize = 0;
+    while (true) {
+        const idx = mem.findScalarPos(u8, name, pos, '.') orelse {
+            if (pos < name.len) {
+                try w.writeByte(@intCast(name.len - pos));
+                try w.writeAll(name[pos..]);
+            }
+            try w.writeByte(0);
+            break;
+        };
+        if (idx - pos > 0) {
+            try w.writeByte(@intCast(idx - pos));
+            try w.writeAll(name[pos..idx]);
+        }
+        pos = idx + 1;
+    }
+    try w.writeInt(u16, 1, .big); // query type 1 - A, 28 - AAAA
+    try w.writeInt(u16, 1, .big); // query class 1 - internet
+
+    {
+        try w.writeByte(0);
+        try w.writeInt(u16, 41, .big); // option type
+        try w.writeInt(u16, udp_payload_size, .big);
+        try w.writeAll(&[6]u8{ 0, 0, 0, 0, 0, 0 });
+    }
+
+    return w.buffered();
+}
+
+test "dns query" {
+    var buf: [256]u8 = undefined;
+    const q = try query(&buf, 0x6af8, "www.google.com");
+    try testing.expectEqualSlices(u8, testdata.query, q);
+}
+
+fn readName(rec: *Io.Reader, buf: []u8) ![]u8 {
+    var w = Io.Writer.fixed(buf);
+
+    var cr: Io.Reader = undefined; // compression reader
+    var r = rec;
+    while (true) {
+        const n: u8 = try r.takeByte();
+        if (n == 0) {
+            return buf[0..if (w.end > 0) w.end - 1 else 0];
+        }
+        if (n & 0b1100_000 > 0) {
+            const off: u16 = (@as(u16, (n & 0b0011_1111)) << 8) + try r.takeByte();
+            cr = Io.Reader.fixed(r.buffer[off..]);
+            r = &cr;
+            continue;
+        }
+        try w.writeAll(try r.take(n));
+        try w.writeByte('.');
+    }
+}
+
+const Response = struct {
+    const Query = struct {
+        name: []u8,
+        addr_type: u16,
+        class: u16,
+    };
+    const Answer = struct {
+        name: []u8,
+        addr_type: u16,
+        class: u16,
+        ttl: u32,
+        addr: []u8,
+    };
+
+    r: Io.Reader,
+    remaining_answers: u16 = 0,
+    name_buf: [256]u8 = undefined,
+
+    fn init(rec: []const u8) Response {
+        return .{
+            .r = Io.Reader.fixed(rec),
+        };
+    }
+
+    fn header(self: *Response) !Header {
+        const transaction_id = try self.r.takeInt(u16, .big);
+        const flags = try self.r.takeStruct(Flags, .big);
+        const query_count = try self.r.takeInt(u16, .big);
+        const answer_count = try self.r.takeInt(u16, .big);
+        const record_count = try self.r.takeInt(u16, .big);
+        const additional_count = try self.r.takeInt(u16, .big);
+        self.remaining_answers = answer_count;
+        return .{
+            .transaction_id = transaction_id,
+            .flags = flags,
+            .query_count = query_count,
+            .answer_count = answer_count,
+            .record_count = record_count,
+            .additional_count = additional_count,
+        };
+    }
+
+    fn query(self: *Response) !Query {
+        const name = try readName(&self.r, &self.name_buf);
+        const addr_type = try self.r.takeInt(u16, .big);
+        const class = try self.r.takeInt(u16, .big);
+        return .{
+            .name = name,
+            .addr_type = addr_type,
+            .class = class,
+        };
+    }
+
+    fn answer(self: *Response) !?Answer {
+        if (self.remaining_answers == 0) return null;
+        const name = try readName(&self.r, &self.name_buf);
+        const addr_type = try self.r.takeInt(u16, .big);
+        const class = try self.r.takeInt(u16, .big);
+        const ttl = try self.r.takeInt(u32, .big);
+        const len = try self.r.takeInt(u16, .big);
+        const addr = try self.r.peek(len);
+        self.r.toss(len);
+        self.remaining_answers -= 1;
+        return .{
+            .name = name,
+            .addr_type = addr_type,
+            .class = class,
+            .ttl = ttl,
+            .addr = addr,
+        };
+    }
+};
+
+test "dns response" {
+    var r = Io.Reader.fixed(testdata.response);
+    var name_buf: [256]u8 = undefined;
+
+    const transaction_id = try r.takeInt(u16, .big);
+    const flags = try r.takeStruct(Flags, .big);
+    const query_count = try r.takeInt(u16, .big);
+    const answer_count = try r.takeInt(u16, .big);
+    const record_count = try r.takeInt(u16, .big);
+    const additional_count = try r.takeInt(u16, .big);
+
+    try testing.expectEqual(0x6af8, transaction_id);
+    _ = flags;
+    try testing.expectEqual(1, query_count);
+    try testing.expectEqual(8, answer_count);
+    try testing.expectEqual(0, record_count);
+    try testing.expectEqual(1, additional_count);
+
+    const query_name = try readName(&r, &name_buf);
+    std.debug.print("query name: {s}\n", .{query_name});
+    _ = try r.takeInt(u16, .big);
+    _ = try r.takeInt(u16, .big);
+
+    for (0..answer_count) |_| {
+        const name = try readName(&r, &name_buf);
+        std.debug.print("name: {s}\n", .{name});
+
+        //_ = try r.takeInt(u16, .big); // TODO
+
+        const addr_type = try r.takeInt(u16, .big);
+        const addr_class = try r.takeInt(u16, .big);
+        const ttl = try r.takeInt(u32, .big);
+        const len = try r.takeInt(u16, .big);
+        const addr = try r.peek(len);
+        r.toss(len);
+
+        try testing.expectEqual(1, addr_type);
+        try testing.expectEqual(1, addr_class);
+        try testing.expectEqual(4, len);
+        try testing.expectEqual(60, ttl);
+        std.debug.print("addr: {x}\n", .{addr});
+        for (addr) |b| {
+            std.debug.print("{d}.", .{b});
+        }
+        std.debug.print("\n", .{});
+    }
+}
+
+test "dns response 2" {
+    var r = Response.init(testdata.response);
+
+    const h = try r.header();
+    try testing.expectEqual(0x6af8, h.transaction_id);
+    try testing.expectEqual(1, h.query_count);
+    try testing.expectEqual(8, h.answer_count);
+    try testing.expectEqual(0, h.record_count);
+    try testing.expectEqual(1, h.additional_count);
+
+    const q = try r.query();
+    try testing.expectEqualStrings("www.google.com", q.name);
+    try testing.expectEqual(1, q.class);
+    try testing.expectEqual(1, q.addr_type);
+
+    while (try r.answer()) |a| {
+        try testing.expectEqualStrings("www.google.com", a.name);
+        try testing.expectEqual(1, a.class);
+        try testing.expectEqual(1, a.addr_type);
+        try testing.expectEqual(60, a.ttl);
+        try testing.expectEqual(4, a.addr.len);
+
+        try testing.expectEqual(142, a.addr[0]);
+        try testing.expectEqual(251, a.addr[1]);
+        try testing.expect(a.addr[2] >= 150 and a.addr[2] <= 157);
+        try testing.expectEqual(119, a.addr[3]);
+    }
+}
+
+const testdata = struct {
+    const query = &hexToBytes(
+        \\ 6a f8 01 00 00 01 00 00 00 00 00 01 03 77 77 77
+        \\ 06 67 6f 6f 67 6c 65 03 63 6f 6d 00 00 01 00 01
+        \\ 00 00 29 05 c0 00 00 00 00 00 00
+    );
+    const response = &hexToBytes(
+        \\ 6a f8 81 80 00 01 00 08 00 00 00 01 03 77 77 77
+        \\ 06 67 6f 6f 67 6c 65 03 63 6f 6d 00 00 01 00 01
+        \\ c0 0c 00 01 00 01 00 00 00 3c 00 04 8e fb 9a 77
+        \\ c0 0c 00 01 00 01 00 00 00 3c 00 04 8e fb 99 77
+        \\ c0 0c 00 01 00 01 00 00 00 3c 00 04 8e fb 97 77
+        \\ c0 0c 00 01 00 01 00 00 00 3c 00 04 8e fb 9d 77
+        \\ c0 0c 00 01 00 01 00 00 00 3c 00 04 8e fb 96 77
+        \\ c0 0c 00 01 00 01 00 00 00 3c 00 04 8e fb 98 77
+        \\ c0 0c 00 01 00 01 00 00 00 3c 00 04 8e fb 9b 77
+        \\ c0 0c 00 01 00 01 00 00 00 3c 00 04 8e fb 9c 77
+        \\ 00 00 29 10 00 00 00 00 00 00 00
+    );
+};
+
+pub fn hexToBytes(comptime hex: []const u8) [removeNonHex(hex).len / 2]u8 {
+    @setEvalBranchQuota(1000 * 100);
+    const hex2 = comptime removeNonHex(hex);
+    comptime var res: [hex2.len / 2]u8 = undefined;
+    _ = comptime std.fmt.hexToBytes(&res, hex2) catch unreachable;
+    return res;
+}
+
+fn removeNonHex(comptime hex: []const u8) []const u8 {
+    @setEvalBranchQuota(1000 * 100);
+    var res: [hex.len]u8 = undefined;
+    var i: usize = 0;
+    for (hex) |c| {
+        if (std.ascii.isHex(c)) {
+            res[i] = c;
+            i += 1;
+        }
+    }
+    return res[0..i];
 }
