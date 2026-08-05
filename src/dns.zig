@@ -103,8 +103,7 @@ pub const Response = struct {
 
     r: Io.Reader,
     remaining_answers: u16 = 0,
-    domain_buf: [256]u8 = undefined,
-    cname_buf: [256]u8 = undefined,
+    domain_buf: [2][256]u8 = undefined,
 
     pub fn init(rec: []const u8) Response {
         return .{
@@ -124,7 +123,8 @@ pub const Response = struct {
             }
             if (n & 0b1100_000 > 0) {
                 const off: u16 = (@as(u16, (n & 0b0011_1111)) << 8) + try r.takeByte();
-                cr = Io.Reader.fixed(r.buffer[off..]);
+                if (off >= self.r.buffer.len) return error.InvalidCompressionLabel;
+                cr = Io.Reader.fixed(self.r.buffer[off..]);
                 r = &cr;
                 continue;
             }
@@ -152,7 +152,7 @@ pub const Response = struct {
     }
 
     pub fn query(self: *Response) !Query {
-        const domain = try self.domainName(&self.domain_buf);
+        const domain = try self.domainName(&self.domain_buf[0]);
         const query_type: QueryType = @fromBackingInt(@intCast(try self.r.takeInt(u16, .big)));
         const class = try self.r.takeInt(u16, .big);
         return .{
@@ -164,13 +164,13 @@ pub const Response = struct {
 
     pub fn answer(self: *Response) !?Answer {
         if (self.remaining_answers == 0) return null;
-        const domain = try self.domainName(&self.domain_buf);
+        const domain = try self.domainName(&self.domain_buf[0]);
         const query_type: QueryType = @fromBackingInt(@intCast(try self.r.takeInt(u16, .big)));
         const class = try self.r.takeInt(u16, .big);
         const ttl = try self.r.takeInt(u32, .big);
         const len = try self.r.takeInt(u16, .big);
         const addr = if (query_type == .cname)
-            try self.domainName(&self.cname_buf)
+            try self.domainName(&self.domain_buf[1])
         else
             try self.r.take(len);
         self.remaining_answers -= 1;
@@ -185,7 +185,7 @@ pub const Response = struct {
 };
 
 test "dns response " {
-    var r = Response.init(testdata.response);
+    var r = Response.init(testdata.answer);
 
     const h = try r.header();
     try testing.expectEqual(0x6af8, h.transaction_id);
@@ -233,12 +233,44 @@ test "cname answer" {
     try testing.expectEqual(.a, q.query_type);
 
     var a = (try r.answer()).?;
-    try testing.expectEqualStrings("gmail.google.com", a.domain);
     try testing.expectEqual(.cname, a.query_type);
-    std.debug.print("{s} {}\n", .{ a.domain, a });
+    try testing.expectEqualStrings("gmail.google.com", a.domain);
+    try testing.expectEqualStrings("www3.l.google.com", a.addr);
 
     a = (try r.answer()).?;
     try testing.expectEqual(.a, a.query_type);
+    try testing.expectEqualStrings("www3.l.google.com", a.domain);
+    try testing.expectEqualSlices(u8, &.{ 192, 178, 25, 174 }, a.addr);
+    try testing.expectEqual(60, a.ttl);
+}
+
+test "cname answer2" {
+    var r = Response.init(testdata.answer_with_two_label_compressions);
+
+    const h = try r.header();
+    try testing.expectEqual(1, h.transaction_id);
+    try testing.expectEqual(1, h.query_count);
+    try testing.expectEqual(2, h.answer_count);
+    try testing.expectEqual(0, h.record_count);
+    try testing.expectEqual(1, h.additional_count);
+    try testing.expectEqual(Flags{ .qr = 1, .ra = 1, .rd = 1 }, h.flags);
+    try testing.expectEqual(null, h.err());
+
+    const q = try r.query();
+    try testing.expectEqualStrings("gmail.google.com", q.domain);
+    try testing.expectEqual(1, q.class);
+    try testing.expectEqual(.a, q.query_type);
+
+    var a = (try r.answer()).?;
+    try testing.expectEqual(.cname, a.query_type);
+    try testing.expectEqualStrings("gmail.google.com", a.domain);
+    try testing.expectEqualStrings("www3.l.google.com", a.addr);
+
+    a = (try r.answer()).?;
+    try testing.expectEqual(.a, a.query_type);
+    try testing.expectEqualStrings("www3.l.google.com", a.domain);
+    try testing.expectEqualSlices(u8, &.{ 216, 58, 205, 142 }, a.addr);
+    try testing.expectEqual(60, a.ttl);
 }
 
 test "dns query" {
@@ -253,7 +285,7 @@ const testdata = struct {
         \\ 06 67 6f 6f 67 6c 65 03 63 6f 6d 00 00 01 00 01
         \\ 00 00 29 05 c0 00 00 00 00 00 00
     );
-    const response = &hexToBytes(
+    const answer = &hexToBytes(
         \\ 6a f8 81 80 00 01 00 08 00 00 00 01 03 77 77 77
         \\ 06 67 6f 6f 67 6c 65 03 63 6f 6d 00 00 01 00 01
         \\ c0 0c 00 01 00 01 00 00 00 3c 00 04 8e fb 9a 77
@@ -273,6 +305,15 @@ const testdata = struct {
         \\  77 77 33 01 6c 06 67 6f 6f 67 6c 65 03 63 6f 6d
         \\  00 c0 2e 00 01 00 01 00 00 00 3c 00 04 c0 b2 19
         \\  ae 00 00 29 10 00 00 00 00 00 00 00
+    );
+
+    const answer_with_two_label_compressions = &hexToBytes(
+        \\ 00 01 81 80 00 01 00 02 00 00 00 01 05 67 6d 61
+        \\ 69 6c 06 67 6f 6f 67 6c 65 03 63 6f 6d 00 00 01
+        \\ 00 01 c0 0c 00 05 00 01 00 00 00 3c 00 09 04 77
+        \\ 77 77 33 01 6c c0 12 c0 2e 00 01 00 01 00 00 00
+        \\ 3c 00 04 d8 3a cd 8e 00 00 29 04 d0 00 00 00 00
+        \\ 00 00
     );
 };
 
