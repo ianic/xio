@@ -702,6 +702,7 @@ fn idle(ev: *Evented) void {
                 },
                 .cleanup => @panic("failed to notify other threads that we are exiting"),
                 _ => if (@as(?*Fiber, ready_fiber: switch (@as(u2, @truncate(cqe.user_data))) {
+                    // fiber
                     0b00 => {
                         const ready_fiber: *Fiber = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
                         ready_fiber.complete(.{
@@ -710,35 +711,36 @@ fn idle(ev: *Evented) void {
                         });
                         break :ready_fiber ready_fiber;
                     },
-                    0b01 => {
-                        ev.getSqe().asyncCancel(
-                            @backingInt(Completion.Userdata.wakeup),
-                            cqe.user_data & ~@as(usize, 0b11),
-                        );
-                        break :ready_fiber null;
-                    },
+                    // unused
+                    0b01 => unreachable,
+                    // batch operation
                     0b10 => {
-                        const batch_userdata: *Io.Operation.Storage.Pending.Userdata =
+                        // cqe.userdata points to pending operation
+                        const pending_userdata: *Io.Operation.Storage.Pending.Userdata =
                             @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                        const batch: *Io.Batch = @ptrFromInt(batch_userdata[0]);
+                        const batch: *Io.Batch = @ptrFromInt(pending_userdata[0]);
+                        const batch_userdata: *usize = @ptrCast(&batch.userdata);
 
-                        const next: usize = @as(*usize, @ptrCast(&batch.userdata)).*;
-                        batch_userdata[0..3].* = .{ next, @as(u32, @bitCast(cqe.res)), cqe.flags };
-                        @as(*usize, @ptrCast(&batch.userdata)).* = cqe.user_data;
+                        // batch.userdata holds pointer to the completed operation or batch fiber
+                        const next = batch_userdata.*;
+                        pending_userdata[0..3].* = .{ next, @as(u32, @bitCast(cqe.res)), cqe.flags };
+                        batch_userdata.* = cqe.user_data;
 
                         break :ready_fiber switch (@as(u2, @truncate(next))) {
                             0b00, 0b01 => @ptrFromInt(next & ~@as(usize, 0b11)),
                             0b10, 0b11 => null,
                         };
                     },
+                    // batch timeout
                     0b11 => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
                         .SUCCESS => unreachable, // no event count specified
                         .TIME => {
-                            const context: *usize = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                            const fiber = @atomicRmw(usize, context, .Add, 0b01, .acquire);
-                            break :ready_fiber switch (@as(u2, @truncate(fiber))) {
+                            const batch_userdata: *usize = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
+                            const next = batch_userdata.*;
+                            batch_userdata.* += 0b01;
+                            break :ready_fiber switch (@as(u2, @truncate(next))) {
                                 else => unreachable, // timeout completed multiple times
-                                0b00 => @ptrFromInt(fiber & ~@as(usize, 0b11)),
+                                0b00 => @ptrFromInt(next & ~@as(usize, 0b11)),
                                 0b10 => null,
                             };
                         },
@@ -1388,7 +1390,7 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
         },
         .net_receive => |o| .{
             .net_receive = r: {
-                const opt_err, const n = ev.netReceive(o.socket_handle, o.message_buffer, o.data_buffer, o.flags);
+                const opt_err, const n = ev.netReceive(o.socket_handle, o.message_buffer, o.data_buffer, o.flags, .none);
                 break :r .{
                     if (opt_err) |err| switch (err) {
                         error.Canceled => |e| return e,
@@ -1462,6 +1464,43 @@ fn batchAwaitConcurrent(
     timeout: Io.Timeout,
 ) Io.Batch.AwaitConcurrentError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
+
+    if (batch.storage.len == 1) {
+        const index = batch.submitted.head;
+        const storage = &batch.storage[index.toIndex()];
+        if (@as(?Io.Operation.Result, result: switch (storage.submission.operation) {
+            .net_receive => |o| {
+                const recv_err, const message_i = ev.netReceive(
+                    o.socket_handle,
+                    o.message_buffer,
+                    o.data_buffer,
+                    o.flags,
+                    timeout,
+                );
+                if (recv_err) |err| if (err == error.Canceled and timeout != .none and message_i == 0) {
+                    return error.Timeout;
+                };
+                break :result .{ .net_receive = .{ recv_err, message_i } };
+            },
+            else => unreachable,
+        })) |result| {
+            switch (batch.completed.tail) {
+                .none => batch.completed.head = index,
+                else => |tail_index| batch.storage[tail_index.toIndex()].completion.node.next = index,
+            }
+            batch.completed.tail = index;
+            storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
+        } else {
+            switch (batch.pending.tail) {
+                .none => batch.pending.head = index,
+                else => |tail_index| batch.storage[tail_index.toIndex()].pending.node.next = index,
+            }
+            batch.pending.tail = index;
+            storage.pending.userdata[0] = @intFromPtr(batch);
+        }
+        return;
+    }
+
     try ev.batchDrainSubmitted(batch, true);
 
     const timespec: linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = while (true) {
@@ -1495,8 +1534,7 @@ fn batchAwaitConcurrent(
             },
         }
     };
-    {
-        // TODO: rethink cancelation
+    { // set timeout
         ev.getSqe().timeout(
             @intFromPtr(&batch.userdata) | 0b11,
             &timespec,
@@ -1515,14 +1553,17 @@ fn batchAwaitConcurrent(
                 batch.pending.head != .none) e,
         };
     }
-    const sqe, const fiber = try ev.enqueue();
-    sqe.timeoutRemove(@intFromPtr(fiber), @intFromPtr(&batch.userdata) | 0b11);
-    ev.yield(null, .nothing);
-    switch (fiber.errno()) {
-        .SUCCESS => return,
-        .BUSY, .NOENT => {},
-        else => |err| unexpectedErrno(err) catch {},
+    { // remove timeout
+        const sqe, const fiber = try ev.enqueue();
+        sqe.timeoutRemove(@intFromPtr(fiber), @intFromPtr(&batch.userdata) | 0b11);
+        ev.yield(null, .nothing);
+        switch (fiber.errno()) {
+            .SUCCESS => return,
+            .BUSY, .NOENT, .ALREADY => {}, // race between expiration and removal
+            else => |err| unexpectedErrno(err) catch {},
+        }
     }
+    // drain timeout completion
     while (true) {
         batchDrainReady(batch) catch |err| switch (err) {
             error.Timeout => return,
@@ -1539,8 +1580,6 @@ fn batchDrainSubmitted(
 ) (Io.ConcurrentError || Io.Cancelable)!void {
     var index = batch.submitted.head;
     if (index == .none) return;
-    // TODO:
-    //try maybe_sync.cancelRegion().awaitIoUring(ev);
     errdefer batch.submitted.head = index;
     while (index != .none) {
         const storage = &batch.storage[index.toIndex()];
@@ -1619,12 +1658,16 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
         var next: usize = @intFromPtr(head);
         var timeout = false;
         while (cond: switch (@as(u2, @truncate(next))) {
+            // next is ptr to the batch fiber
             0b00 => if (timeout) return error.Timeout else false,
+            // next is ptr to the batch fiber and last completion was timeout
             0b01 => {
                 assert(!timeout);
                 return error.Timeout;
             },
+            // next is ptr to the operation
             0b10 => true,
+            // next is ptr to the operation and last completion was timeout
             0b11 => {
                 assert(!timeout);
                 timeout = true;
@@ -1638,11 +1681,12 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
                 .result = @bitCast(@as(u32, @intCast(operation_userdata[1]))),
                 .flags = @intCast(operation_userdata[2]),
             };
+            assert(completion.flags & linux.IORING_CQE_F_SKIP == 0);
+
             const pending: *Io.Operation.Storage.Pending =
                 @fieldParentPtr("userdata", operation_userdata);
             const storage: *Io.Operation.Storage = @fieldParentPtr("pending", pending);
             const index: Io.Operation.OptionalIndex = .fromIndex(storage - batch.storage.ptr);
-            assert(completion.flags & linux.IORING_CQE_F_SKIP == 0);
             switch (pending.node.prev) {
                 .none => batch.pending.head = pending.node.next,
                 else => |prev_index| batch.storage[prev_index.toIndex()].pending.node.next =
@@ -3933,6 +3977,7 @@ fn netReceive(
     message_buffer: []net.IncomingMessage,
     data_buffer: []u8,
     flags: net.ReceiveFlags,
+    timeout: Io.Timeout,
 ) struct { ?net.Socket.ReceiveError, usize } {
     var message_i: usize = 0;
     var data_i: usize = 0;
@@ -3952,11 +3997,21 @@ fn netReceive(
             .flags = undefined,
         };
 
-        const sqe, const fiber = ev.enqueue() catch |err| return .{ err, message_i };
+        var sqe, const fiber = ev.enqueue() catch |err| return .{ err, message_i };
         sqe.recvmsg(@intFromPtr(fiber), handle, &msg, linux.MSG.NOSIGNAL |
+            @as(u32, if (message_i > 0) linux.MSG.DONTWAIT else 0) |
             @as(u32, if (flags.oob) linux.MSG.OOB else 0) |
             @as(u32, if (flags.peek) linux.MSG.PEEK else 0) |
             @as(u32, if (flags.trunc) linux.MSG.TRUNC else 0));
+
+        if (timeout != .none and message_i == 0) {
+            sqe.flags.io_link = true;
+            const timespec, const timespec_flags = timeoutToLinux(timeout);
+            sqe = ev.getSqe();
+            sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), &timespec.?, timespec_flags);
+            sqe.flags.cqe_skip_success = true;
+        }
+
         ev.yield(null, .nothing);
         const completion = fiber.completion();
         switch (completion.errno()) {
@@ -3976,10 +4031,12 @@ fn netReceive(
                     },
                 };
                 message_i += 1;
-                continue;
             },
-            .AGAIN => unreachable,
-            .INTR, .CANCELED => {},
+            // recv with msg.dontwait completed without new data
+            .AGAIN => return .{ null, message_i },
+            // timeout expired
+            .CANCELED => if (timeout != .none) return .{ error.Canceled, message_i },
+            .INTR => {},
             .BADF => |err| return .{ errnoBug(err), message_i },
             .NFILE => return .{ error.SystemFdQuotaExceeded, message_i },
             .MFILE => return .{ error.ProcessFdQuotaExceeded, message_i },
