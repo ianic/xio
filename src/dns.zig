@@ -14,15 +14,15 @@ pub const Header = packed struct {
     record_count: u16 = 0,
     additional_count: u16 = 0,
 
-    pub const DnsError = error{ ServerFailed, NonexistentDomain, Refused, NameServerFailure };
+    pub const Error = error{ NsServerFailed, NsNonexistentDomain, NsRefused, NsCode };
 
-    pub fn err(self: Header) ?DnsError {
+    pub fn err(self: Header) ?Error {
         return switch (self.flags.rcode) {
             0 => null,
-            2 => error.ServerFailed,
-            3 => error.NonexistentDomain,
-            4 => error.Refused,
-            else => error.NameServerFailure,
+            2 => error.NsServerFailed,
+            3 => error.NsNonexistentDomain,
+            4 => error.NsRefused,
+            else => error.NsCode,
         };
     }
 };
@@ -41,7 +41,13 @@ pub const Flags = packed struct {
     qr: u1 = 0, // query = 1, response = 2
 };
 
-pub fn query(buf: []u8, transaction_id: u16, domain: []const u8) ![]u8 {
+pub fn query(
+    buf: []u8,
+    transaction_id: u16,
+    domain: []const u8,
+    family: Io.net.IpAddress.Family,
+) ![]u8 {
+    assert(domain.len <= 253);
     var w = Io.Writer.fixed(buf);
     { // header
         try w.writeInt(u16, transaction_id, .big);
@@ -68,7 +74,10 @@ pub fn query(buf: []u8, transaction_id: u16, domain: []const u8) ![]u8 {
             }
             pos = idx + 1;
         }
-        try w.writeInt(u16, 1, .big); // query type 1 - A, 28 - AAAA
+        try w.writeInt(u16, switch (family) {
+            .ip4 => 1,
+            .ip6 => 28,
+        }, .big); // query type 1 - A, 28 - AAAA
         try w.writeInt(u16, 1, .big); // query class 1 - internet
     }
     { // options
@@ -182,6 +191,17 @@ pub const Response = struct {
             .addr = addr,
         };
     }
+
+    pub fn validate(self: *Response, transaction_id: u16, domain: []const u8) !void {
+        const h = try self.header();
+        if (h.transaction_id != transaction_id) return error.TransactionId;
+        if (h.err()) |err| return err;
+        if (h.answer_count == 0) return error.NoData;
+        if (h.query_count != 1) return error.MissingQuery;
+
+        const q = try self.query();
+        if (!std.mem.eql(u8, q.domain, domain)) return error.InvalidQueryDomain;
+    }
 };
 
 test "dns response " {
@@ -275,7 +295,7 @@ test "cname answer2" {
 
 test "dns query" {
     var buf: [256]u8 = undefined;
-    const q = try query(&buf, 0x6af8, "www.google.com");
+    const q = try query(&buf, 0x6af8, "www.google.com", .ip4);
     try testing.expectEqualSlices(u8, testdata.query, q);
 }
 

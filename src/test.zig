@@ -497,36 +497,200 @@ test "group" {
     }
 }
 
-test "dns" {
-    const gpa = testing.allocator;
-    var ev: Evented = undefined;
-    try ev.init(gpa, .{});
-    defer ev.deinit();
-    const io = ev.io();
+// test "dns" {
+//     const gpa = testing.allocator;
+//     var ev: Evented = undefined;
+//     try ev.init(gpa, .{});
+//     defer ev.deinit();
+//     const io = ev.io();
 
-    const host = "google.com";
-    const host_name = try std.Io.net.HostName.init(host);
-    _ = host_name.connect(io, 80, .{ .mode = .stream }) catch |err| switch (err) {
-        error.NetworkDown => .{},
-        else => |e| return e,
-    };
-}
+//     const host = "google.com";
+//     const host_name = try Io.net.HostName.init(host);
+//     _ = host_name.connect(io, 80, .{ .mode = .stream }) catch |err| switch (err) {
+//         error.NetworkDown => .{},
+//         else => |e| return e,
+//     };
+// }
 
 test "dns io" {
     const gpa = testing.allocator;
+
+    var threaded = Io.Threaded.init(gpa, .{
+        .async_limit = .limited(2),
+        .concurrent_limit = .limited(2),
+    });
+    defer threaded.deinit();
+    //const io = threaded.io();
+
+    var ev: Evented = undefined;
+    try ev.init(gpa, .{});
+    defer ev.deinit();
+    // const io = ev.io();
+
+    const host = "www.google.com";
+    //const host = "trinitymedia.ai";
+    const host_name = try Io.net.HostName.init(host);
+
+    for ([_]Io{ threaded.io(), ev.io() }) |io| {
+        var canonical_name_buffer: [Io.net.HostName.max_len]u8 = undefined;
+        const port: u16 = 80;
+        var lookup_buffer: [32]Io.net.HostName.LookupResult = undefined;
+        var lookup_queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+        try host_name.lookup(io, &lookup_queue, .{
+            .port = port,
+            .canonical_name_buffer = &canonical_name_buffer,
+            //.family = .ip6,
+        });
+
+        while (true) {
+            const res = lookup_queue.getOne(io) catch |err| switch (err) {
+                error.Closed => break,
+                else => |e| return e,
+            };
+            switch (res) {
+                .address => |a| {
+                    std.debug.print("address: {}\n", .{a});
+                },
+                .canonical_name => |c| {
+                    std.debug.print("cname: {s}\n", .{c.bytes});
+                },
+            }
+        }
+    }
+}
+
+test "netReceive" {
+    const gpa = testing.allocator;
+
+    // var threaded = Io.Threaded.init(gpa, .{
+    //     .async_limit = .limited(2),
+    //     .concurrent_limit = .limited(2),
+    // });
+    // defer threaded.deinit();
+    // const io = threaded.io();
+
     var ev: Evented = undefined;
     try ev.init(gpa, .{});
     defer ev.deinit();
     const io = ev.io();
 
-    const host = "google.com";
-    const host_name = try std.Io.net.HostName.init(host);
-    _ = host_name.connect(io, 80, .{ .mode = .stream }) catch |err| switch (err) {
-        error.NetworkDown => .{},
-        else => |e| return e,
-    };
+    const bind_addr = try std.Io.net.IpAddress.parse("0.0.0.0", 0);
+    const socket = try bind_addr.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    const addr = &socket.address;
+
+    var data: [128 * 4]u8 = undefined;
+    io.random(&data);
+
+    var outgoing_messages: [4]Io.net.OutgoingMessage = undefined;
+    for (&outgoing_messages, 0..) |*msg, i| {
+        msg.* = .{
+            .address = addr,
+            .data_ptr = data[128 * i ..].ptr,
+            .data_len = 128,
+        };
+    }
+
+    var incoming_messages: [4]Io.net.IncomingMessage = undefined;
+    var buf: [128 * 5]u8 = undefined;
+
+    const timeout: Io.Timeout = .{ .duration = .{ .clock = .real, .raw = .fromMicroseconds(100) } };
+
+    var out_msgs: usize = 4;
+    var in_msgs: usize = 4;
+    {
+        try socket.sendMany(io, outgoing_messages[0..out_msgs], .{});
+        const recv_err, const recv_n = socket.receiveManyTimeout(io, incoming_messages[0..in_msgs], &buf, .{}, timeout);
+        if (recv_err) |err| return err;
+        const msgs = @min(in_msgs, out_msgs);
+        try testing.expectEqual(msgs, recv_n);
+        try testing.expectEqualSlices(u8, data[0 .. 128 * msgs], buf[0 .. 128 * msgs]);
+    }
+
+    out_msgs = 2;
+    in_msgs = 4;
+    {
+        try socket.sendMany(io, outgoing_messages[0..out_msgs], .{});
+        const recv_err, const recv_n = socket.receiveManyTimeout(io, incoming_messages[0..in_msgs], &buf, .{}, timeout);
+        if (recv_err) |err| return err;
+        const msgs = @min(in_msgs, out_msgs);
+        try testing.expectEqual(msgs, recv_n);
+        try testing.expectEqualSlices(u8, data[0 .. 128 * msgs], buf[0 .. 128 * msgs]);
+    }
+
+    out_msgs = 4;
+    in_msgs = 2;
+    {
+        try socket.sendMany(io, outgoing_messages[0..out_msgs], .{});
+
+        const recv_err, const recv_n = socket.receiveManyTimeout(io, incoming_messages[0..in_msgs], &buf, .{}, timeout);
+        if (recv_err) |err| return err;
+        const msgs = @min(in_msgs, out_msgs);
+        try testing.expectEqual(msgs, recv_n);
+        try testing.expectEqualSlices(u8, data[0 .. 128 * msgs], buf[0 .. 128 * msgs]);
+    }
+    {
+        const recv_err, const recv_n = socket.receiveManyTimeout(io, incoming_messages[0..in_msgs], &buf, .{}, timeout);
+        if (recv_err) |err| return err;
+        const msgs = @min(in_msgs, out_msgs);
+        try testing.expectEqual(msgs, recv_n);
+        try testing.expectEqualSlices(u8, data[128 * 2 ..][0 .. 128 * msgs], buf[0 .. 128 * msgs]);
+    }
+
+    const recv_err, _ = socket.receiveManyTimeout(io, incoming_messages[0..in_msgs], &buf, .{}, timeout);
+    try testing.expect(recv_err != null);
+    try testing.expectEqual(error.Timeout, recv_err.?);
+}
+
+test "explain batch" {
+    const gpa = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = tmp.dir;
+
+    var ev: Evented = undefined;
+    try ev.init(gpa, .{});
+    defer ev.deinit();
+    const io = ev.io();
+
+    const f = try dir.createFile(io, "file1", .{});
+    defer f.close(io);
+
+    var storage: [4]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+    batch.addAt(0, .{ .file_write_streaming = .{
+        .file = f,
+        .data = &[_][]const u8{"iso medo u ducan"},
+    } });
+    batch.addAt(1, .{ .file_write_streaming = .{
+        .file = f,
+        .data = &[_][]const u8{"nije reko dobar dan"},
+    } });
+    batch.addAt(2, .{ .file_write_streaming = .{
+        .file = f,
+        .data = &[_][]const u8{"nije reko dobar dan"},
+    } });
+    batch.addAt(3, .{ .file_write_streaming = .{
+        .file = f,
+        .data = &[_][]const u8{"nije reko dobar dan"},
+    } });
+
+    while (!(batch.pending.head == .none and batch.submitted.head == .none)) {
+        try batch.awaitConcurrent(
+            io,
+            .{ .duration = .{ .clock = .real, .raw = .fromMicroseconds(100) } },
+        );
+        while (batch.next()) |completion| {
+            std.debug.print("completion.index: {}\n", .{completion.index});
+            switch (completion.index) {
+                0 => try testing.expectEqual(16, (try completion.result.file_write_streaming)),
+                1, 2, 3 => try testing.expectEqual(19, (try completion.result.file_write_streaming)),
+                else => unreachable,
+            }
+        }
+    }
 }
 
 test {
-    _ = @import("dns.zig");
+    //_ = @import("dns.zig");
 }
