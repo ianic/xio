@@ -1390,7 +1390,7 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
         },
         .net_receive => |o| .{
             .net_receive = r: {
-                const opt_err, const n = ev.netReceive(o.socket_handle, o.message_buffer, o.data_buffer, o.flags, .none);
+                const opt_err, const n = ev.netReceive(o.socket_handle, o.message_buffer, o.data_buffer, o.flags);
                 break :r .{
                     if (opt_err) |err| switch (err) {
                         error.Canceled => |e| return e,
@@ -1470,17 +1470,18 @@ fn batchAwaitConcurrent(
         const storage = &batch.storage[index.toIndex()];
         if (@as(?Io.Operation.Result, result: switch (storage.submission.operation) {
             .net_receive => |o| {
-                const recv_err, const message_i = ev.netReceive(
+                const recv_err, const message_i = ev.netReceiveTimeout(
                     o.socket_handle,
                     o.message_buffer,
                     o.data_buffer,
                     o.flags,
                     timeout,
                 );
-                if (recv_err) |err| if (err == error.Canceled and timeout != .none and message_i == 0) {
-                    return error.Timeout;
-                };
-                break :result .{ .net_receive = .{ recv_err, message_i } };
+
+                break :result .{ .net_receive = .{ if (recv_err) |err| switch (err) {
+                    error.Timeout => |e| return e,
+                    else => |e| e,
+                } else null, message_i } };
             },
             else => unreachable,
         })) |result| {
@@ -3977,8 +3978,25 @@ fn netReceive(
     message_buffer: []net.IncomingMessage,
     data_buffer: []u8,
     flags: net.ReceiveFlags,
-    timeout: Io.Timeout,
 ) struct { ?net.Socket.ReceiveError, usize } {
+    const recv_err, const recv_n = netReceiveTimeout(ev, handle, message_buffer, data_buffer, flags, .none);
+    return .{
+        if (recv_err) |err| switch (err) {
+            error.Timeout => unreachable,
+            else => |e| e,
+        } else null,
+        recv_n,
+    };
+}
+
+fn netReceiveTimeout(
+    ev: *Evented,
+    handle: net.Socket.Handle,
+    message_buffer: []net.IncomingMessage,
+    data_buffer: []u8,
+    flags: net.ReceiveFlags,
+    timeout: Io.Timeout,
+) struct { ?(net.Socket.ReceiveError || error{Timeout}), usize } {
     var message_i: usize = 0;
     var data_i: usize = 0;
     while (true) {
@@ -4035,7 +4053,7 @@ fn netReceive(
             // recv with msg.dontwait completed without new data
             .AGAIN => return .{ null, message_i },
             // timeout expired
-            .CANCELED => if (timeout != .none) return .{ error.Canceled, message_i },
+            .CANCELED => if (timeout != .none) return .{ error.Timeout, message_i },
             .INTR => {},
             .BADF => |err| return .{ errnoBug(err), message_i },
             .NFILE => return .{ error.SystemFdQuotaExceeded, message_i },
@@ -4204,49 +4222,51 @@ fn netLookup(
     const ev_io = ev.io();
     const domain = host_name.bytes;
 
-    var query_buffer: [dns.udp_payload_size * 2]u8 = undefined;
+    // Prepare queries
     var queries_buffer: [2]struct {
-        data: []const u8 = undefined,
-        addresses: ?usize = null,
-    } = undefined;
+        data_buffer: [dns.udp_payload_size]u8 = undefined,
+        data: []const u8 = &.{},
+        transaction_id: u16 = 0,
+        unknown_hostname: bool = false,
+        address_count: usize = 0,
+
+        fn hasResponse(self: *const @This()) bool {
+            return self.address_count > 0 or self.unknown_hostname;
+        }
+    } = @splat(.{});
     const queries = brk: {
         var n: usize = 0;
-        var pos: usize = 0;
         var entropy: [4]u8 = undefined;
         random(ev, &entropy);
         for ([_]net.IpAddress.Family{ .ip4, .ip6 }) |family| {
             if (options.family == null or options.family.? == family) {
-                const transaction_id = std.mem.readInt(u16, entropy[n * 2 ..][0..2], .big);
-                const query = try dns.query(query_buffer[pos..], transaction_id, domain, family);
-                queries_buffer[n] = .{
-                    .data = query,
-                    .addresses = null,
-                };
-                pos += query.len;
+                const query = &queries_buffer[n];
+                query.transaction_id = std.mem.readInt(u16, entropy[n * 2 ..][0..2], .big);
+                query.data = try dns.query(&query.data_buffer, query.transaction_id, domain, family);
                 n += 1;
             }
         }
         break :brk queries_buffer[0..n];
     };
 
-    const timeout: Io.Timeout = .{ .duration = .{
-        .raw = .{ .nanoseconds = (std.time.ns_per_s / rc.attempts) * @as(i96, rc.timeout_seconds) },
-        .clock = .boot,
-    } };
-
     const bind_addr: Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
     const bind_socket = try netBindIp(ev, &bind_addr, .{ .mode = .dgram, .protocol = .udp });
     defer ev.closeAsync(bind_socket.handle);
 
-    var cname_len: usize = 0; // number of bytes copied to the options.canonical_name_buffer
-    for (0..rc.attempts) |i| {
-        std.debug.print("attemtp {}\n", .{i});
-        // Prepare and send queries
-        var messages_i = brk: {
+    const recv_timeout: Io.Timeout = .{ .duration = .{
+        .raw = .{ .nanoseconds = (std.time.ns_per_s / rc.attempts) * @as(i96, rc.timeout_seconds) },
+        .clock = .boot,
+    } };
+    var now_ts = now(ev, .boot);
+    const final_ts = now_ts.addDuration(.fromSeconds(rc.timeout_seconds));
+    var cname_len: usize = 0; // Number of bytes copied to the options.canonical_name_buffer
+    send: while (now_ts.nanoseconds < final_ts.nanoseconds) : (now_ts = now(ev, .boot)) {
+        // Send queries
+        var pending_messages = brk: {
             var outgoing_messages: [max_messages]net.OutgoingMessage = undefined;
             var n: usize = 0;
             for (queries) |query| {
-                if (query.addresses != null) continue; // Skip responded
+                if (query.hasResponse()) continue;
                 for (rc.nameservers()) |*ns| {
                     outgoing_messages[n] = .{
                         .address = ns,
@@ -4257,111 +4277,108 @@ fn netLookup(
                 }
             }
             if (n == 0) break; // All responded
-
             const send_err, _ = netSend(ev, bind_socket.handle, outgoing_messages[0..n], .{});
             if (send_err != null) return error.NetworkDown;
             break :brk n;
         };
-        //sleep(ev, .{ .duration = .{ .clock = .real, .raw = .fromMilliseconds(100) } }) catch unreachable;
-        while (messages_i > 0) {
-            std.debug.print("recv {}\n", .{messages_i});
-            // Break if all queries has response
-            for (queries) |query| {
-                if (query.addresses == null) break;
-            } else break;
-
-            // Receive
+        // Receive dns responses
+        while (pending_messages > 0) {
             var incoming_messages: [max_messages]net.IncomingMessage = @splat(.init);
             var incomming_buffer: [dns.udp_payload_size * max_messages]u8 = undefined;
-            const recv_err, const recv_n = ev.netReceive(
+            const recv_err, const recv_n = ev.netReceiveTimeout(
                 bind_socket.handle,
-                incoming_messages[0..messages_i],
+                incoming_messages[0..pending_messages],
                 &incomming_buffer,
                 .{},
-                timeout,
+                recv_timeout,
             );
             for (incoming_messages[0..recv_n]) |msg| {
+                var rsp = dns.Response.init(msg.data);
+                const header = rsp.header() catch continue;
+
                 // Ignore replies from addresses we didn't send to.
                 for (rc.nameservers()) |*ns| {
                     if (msg.from.eql(ns)) break;
                 } else continue;
-
-                // Find query by transaction_id
+                // Find query for this response by transaction_id
                 var query = for (queries) |*query| {
-                    if (query.data[0] == msg.data[0] and query.data[1] == msg.data[1]) break query;
+                    if (query.transaction_id == header.transaction_id) break query;
                 } else continue;
-                messages_i -= 1;
+                // Treat this as response to query
+                pending_messages -= 1;
 
-                if (query.addresses != null) continue; // If query is already responded
-
-                const transaction_id = std.mem.readInt(u16, query.data[0..2], .big);
-                var rsp = dns.Response.init(msg.data);
-                rsp.validate(transaction_id, domain) catch |err| switch (err) {
-                    error.NsNonexistentDomain => {
-                        query.addresses = 0; // Negative response
-                        continue;
-                    },
-                    // nameserver errors
-                    error.NsServerFailed, error.NsRefused, error.NsCode, error.NoData => continue,
-                    else => {},
-                };
-                while (rsp.answer() catch continue) |a| {
-                    switch (a.query_type) {
-                        .a => {
-                            if (a.addr.len != 4) return error.InvalidDnsARecord;
-                            try resolved.putOne(ev_io, .{ .address = .{ .ip4 = .{
-                                .bytes = a.addr[0..4].*,
-                                .port = options.port,
-                            } } });
-                            query.addresses = if (query.addresses) |qa| qa + 1 else 1;
-                        },
-                        .aaaa => {
-                            if (a.addr.len != 16) return error.InvalidDnsARecord;
-                            try resolved.putOne(ev_io, .{ .address = .{ .ip6 = .{
-                                .bytes = a.addr[0..16].*,
-                                .port = options.port,
-                            } } });
-                            query.addresses = if (query.addresses) |qa| qa + 1 else 1;
-                        },
-                        .cname => {
-                            if (options.canonical_name_buffer) |cname_buf| {
-                                if (cname_buf.len >= a.addr.len) {
-                                    cname_len = a.addr.len;
-                                    @memcpy(cname_buf[0..a.addr.len], a.addr);
-                                }
+                if (query.hasResponse()) continue;
+                switch (header.flags.rcode) { // Response code
+                    // Success
+                    0 => {
+                        // Check response query section
+                        if (header.query_count > 0) {
+                            const rsp_query = rsp.query() catch continue;
+                            if (!std.mem.eql(u8, rsp_query.domain, domain)) continue;
+                        }
+                        // Collect dns answers
+                        while (rsp.answer() catch continue) |answer| {
+                            switch (answer.query_type) {
+                                .a => {
+                                    if (answer.addr.len != 4) return error.InvalidDnsARecord;
+                                    try resolved.putOne(ev_io, .{ .address = .{ .ip4 = .{
+                                        .bytes = answer.addr[0..4].*,
+                                        .port = options.port,
+                                    } } });
+                                    query.address_count += 1;
+                                },
+                                .aaaa => {
+                                    if (answer.addr.len != 16) return error.InvalidDnsARecord;
+                                    try resolved.putOne(ev_io, .{ .address = .{ .ip6 = .{
+                                        .bytes = answer.addr[0..16].*,
+                                        .port = options.port,
+                                    } } });
+                                    query.address_count += 1;
+                                },
+                                .cname => {
+                                    if (options.canonical_name_buffer) |cname_buf| {
+                                        if (cname_buf.len >= answer.addr.len) {
+                                            cname_len = answer.addr.len;
+                                            @memcpy(cname_buf[0..answer.addr.len], answer.addr);
+                                        }
+                                    }
+                                },
+                                else => continue,
                             }
-                        },
-                        else => continue,
-                    }
+                        }
+                    },
+                    // Nonexistent domain
+                    3 => {
+                        query.unknown_hostname = true;
+                    },
+                    2 => continue, // Server failure, error in processing on the server
+                    else => continue,
                 }
+                for (queries) |q| {
+                    if (!q.hasResponse()) break;
+                } else break :send; // All queries has been responded
             }
-            // TODO
             if (recv_err) |err| switch (err) {
-                // timeout
-                error.Canceled => continue,
-                //error.Timeout => continue,
-                else => return error.NetworkDown,
+                error.Canceled => |e| return e,
+                error.Timeout => continue :send,
+                else => continue,
             };
         }
     }
-
-    if (cname_len > 0) { // put last cname into resloved
+    if (cname_len > 0) { // Put last cname into resloved
         try resolved.putOne(ev_io, .{
             .canonical_name = .{ .bytes = options.canonical_name_buffer.?[0..cname_len] },
         });
     }
 
-    var addresses_n: usize = 0;
-    var nonexistent_n: usize = 0;
+    var address_count: usize = 0;
+    var unknown_hostname: bool = false;
     for (queries) |query| {
-        if (query.addresses) |qa| if (qa > 0) {
-            addresses_n += qa;
-        } else {
-            nonexistent_n += 1;
-        };
+        address_count += query.address_count;
+        if (query.unknown_hostname) unknown_hostname = true;
     }
-    if (addresses_n == 0) {
-        if (nonexistent_n > 0) return error.UnknownHostName;
+    if (address_count == 0) {
+        if (unknown_hostname) return error.UnknownHostName;
         return error.NoAddressReturned;
     }
 }
