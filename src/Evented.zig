@@ -4224,15 +4224,15 @@ fn netLookup(
 
     // Prepare queries
     var queries_buffer: [2]struct {
-        data_buffer: [dns.udp_payload_size]u8 = undefined,
+        data_buffer: [dns.max_query_len]u8 = undefined,
         data: []const u8 = &.{},
         transaction_id: u16 = 0,
-        unknown_hostname: bool = false,
+        response: enum {
+            none,
+            success,
+            nonexistent_domain,
+        } = .none,
         address_count: usize = 0,
-
-        fn hasResponse(self: *const @This()) bool {
-            return self.address_count > 0 or self.unknown_hostname;
-        }
     } = @splat(.{});
     const queries = brk: {
         var n: usize = 0;
@@ -4266,7 +4266,7 @@ fn netLookup(
             var outgoing_messages: [max_messages]net.OutgoingMessage = undefined;
             var n: usize = 0;
             for (queries) |query| {
-                if (query.hasResponse()) continue;
+                if (query.response != .none) continue;
                 for (rc.nameservers()) |*ns| {
                     outgoing_messages[n] = .{
                         .address = ns,
@@ -4284,7 +4284,7 @@ fn netLookup(
         // Receive dns responses
         while (pending_messages > 0) {
             var incoming_messages: [max_messages]net.IncomingMessage = @splat(.init);
-            var incomming_buffer: [dns.udp_payload_size * max_messages]u8 = undefined;
+            var incomming_buffer: [dns.max_response_len * max_messages]u8 = undefined;
             const recv_err, const recv_n = ev.netReceiveTimeout(
                 bind_socket.handle,
                 incoming_messages[0..pending_messages],
@@ -4293,8 +4293,7 @@ fn netLookup(
                 recv_timeout,
             );
             for (incoming_messages[0..recv_n]) |msg| {
-                var rsp = dns.Response.init(msg.data);
-                const header = rsp.header() catch continue;
+                var rsp = dns.Response.init(msg.data) catch continue;
 
                 // Ignore replies from addresses we didn't send to.
                 for (rc.nameservers()) |*ns| {
@@ -4302,17 +4301,17 @@ fn netLookup(
                 } else continue;
                 // Find query for this response by transaction_id
                 var query = for (queries) |*query| {
-                    if (query.transaction_id == header.transaction_id) break query;
+                    if (query.transaction_id == rsp.transaction_id) break query;
                 } else continue;
                 // Treat this as response to query
                 pending_messages -= 1;
 
-                if (query.hasResponse()) continue;
-                switch (header.flags.rcode) { // Response code
-                    // Success
-                    0 => {
+                if (query.response != .none) continue;
+                switch (rsp.flags.rcode) { // Response code
+                    .success => {
+                        query.response = .success;
                         // Check response query section
-                        if (header.query_count > 0) {
+                        if (rsp.query_count > 0) {
                             const rsp_query = rsp.query() catch continue;
                             if (!std.mem.eql(u8, rsp_query.domain, domain)) continue;
                         }
@@ -4347,15 +4346,14 @@ fn netLookup(
                             }
                         }
                     },
-                    // Nonexistent domain
-                    3 => {
-                        query.unknown_hostname = true;
+                    .nonexistent_domain => {
+                        query.response = .nonexistent_domain;
                     },
-                    2 => continue, // Server failure, error in processing on the server
+                    .server_fail => continue,
                     else => continue,
                 }
                 for (queries) |q| {
-                    if (!q.hasResponse()) break;
+                    if (q.response == .none) break;
                 } else break :send; // All queries has been responded
             }
             if (recv_err) |err| switch (err) {
@@ -4375,7 +4373,7 @@ fn netLookup(
     var unknown_hostname: bool = false;
     for (queries) |query| {
         address_count += query.address_count;
-        if (query.unknown_hostname) unknown_hostname = true;
+        if (query.response == .nonexistent_domain) unknown_hostname = true;
     }
     if (address_count == 0) {
         if (unknown_hostname) return error.UnknownHostName;

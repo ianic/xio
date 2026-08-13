@@ -4,42 +4,8 @@ const mem = std.mem;
 const assert = std.debug.assert;
 const testing = std.testing;
 
-pub const udp_payload_size = 1472;
-
-pub const Header = packed struct {
-    transaction_id: u16 = 0,
-    flags: Flags = .{},
-    query_count: u16,
-    answer_count: u16 = 0,
-    record_count: u16 = 0,
-    additional_count: u16 = 0,
-
-    pub const Error = error{ NsServerFailed, NsNonexistentDomain, NsRefused, NsCode };
-
-    pub fn err(self: Header) ?Error {
-        return switch (self.flags.rcode) {
-            0 => null,
-            2 => error.NsServerFailed,
-            3 => error.NsNonexistentDomain,
-            4 => error.NsRefused,
-            else => error.NsCode,
-        };
-    }
-};
-
-pub const Flags = packed struct {
-    rcode: u4 = 0,
-    cd: u1 = 0,
-    ad: u1 = 0,
-    z: u1 = 0,
-    ra: u1 = 0,
-
-    rd: u1 = 0,
-    tc: u1 = 0,
-    aa: u1 = 0,
-    opcode: u4 = 0,
-    qr: u1 = 0, // query = 1, response = 2
-};
+pub const max_query_len = 12 + 255 + 4;
+pub const max_response_len = 512;
 
 pub fn query(
     buf: []u8,
@@ -80,29 +46,44 @@ pub fn query(
         }, .big); // query type 1 - A, 28 - AAAA
         try w.writeInt(u16, 1, .big); // query class 1 - internet
     }
-    { // options
-        try w.writeByte(0);
-        try w.writeInt(u16, 41, .big); // option type
-        try w.writeInt(u16, udp_payload_size, .big);
-        try w.writeAll(&[6]u8{ 0, 0, 0, 0, 0, 0 });
-    }
     return w.buffered();
 }
 
-pub const QueryType = enum(u16) {
-    a = 1,
-    cname = 5,
-    aaaa = 28,
-    _,
+const Flags = packed struct(u16) {
+    rcode: enum(u4) {
+        success = 0,
+        form_err = 1,
+        server_fail = 2,
+        nonexistent_domain = 3,
+        not_implemented = 4,
+        refused = 5,
+        _,
+    } = .success,
+    cd: u1 = 0,
+    ad: u1 = 0,
+    z: u1 = 0,
+    ra: u1 = 0,
+
+    rd: u1 = 0,
+    tc: u1 = 0,
+    aa: u1 = 0,
+    opcode: u4 = 0,
+    qr: u1 = 0, // query = 1, response = 2
 };
 
 pub const Response = struct {
-    const Query = struct {
+    pub const QueryType = enum(u16) {
+        a = 1,
+        cname = 5,
+        aaaa = 28,
+        _,
+    };
+    pub const Query = struct {
         domain: []u8,
         query_type: QueryType,
         class: u16,
     };
-    const Answer = struct {
+    pub const Answer = struct {
         domain: []u8,
         query_type: QueryType,
         class: u16,
@@ -114,9 +95,33 @@ pub const Response = struct {
     remaining_answers: u16 = 0,
     domain_buf: [2][256]u8 = undefined,
 
-    pub fn init(rec: []const u8) Response {
+    transaction_id: u16 = 0,
+    flags: Flags = .{},
+    query_count: u16,
+    answer_count: u16 = 0,
+    record_count: u16 = 0,
+    additional_count: u16 = 0,
+
+    pub fn init(rec: []const u8) error{InvalidDnsPacket}!Response {
+        if (rec.len < 12) return error.InvalidDnsPacket;
+        var r = Io.Reader.fixed(rec);
+        const transaction_id = r.takeInt(u16, .big) catch unreachable;
+        const flags = r.takeStruct(Flags, .big) catch unreachable;
+        const query_count = r.takeInt(u16, .big) catch unreachable;
+        const answer_count = r.takeInt(u16, .big) catch unreachable;
+        const record_count = r.takeInt(u16, .big) catch unreachable;
+        const additional_count = r.takeInt(u16, .big) catch unreachable;
+
         return .{
-            .r = Io.Reader.fixed(rec),
+            .r = r,
+            .remaining_answers = answer_count,
+
+            .transaction_id = transaction_id,
+            .flags = flags,
+            .query_count = query_count,
+            .answer_count = answer_count,
+            .record_count = record_count,
+            .additional_count = additional_count,
         };
     }
 
@@ -142,24 +147,6 @@ pub const Response = struct {
         }
     }
 
-    pub fn header(self: *Response) !Header {
-        const transaction_id = try self.r.takeInt(u16, .big);
-        const flags = try self.r.takeStruct(Flags, .big);
-        const query_count = try self.r.takeInt(u16, .big);
-        const answer_count = try self.r.takeInt(u16, .big);
-        const record_count = try self.r.takeInt(u16, .big);
-        const additional_count = try self.r.takeInt(u16, .big);
-        self.remaining_answers = answer_count;
-        return .{
-            .transaction_id = transaction_id,
-            .flags = flags,
-            .query_count = query_count,
-            .answer_count = answer_count,
-            .record_count = record_count,
-            .additional_count = additional_count,
-        };
-    }
-
     pub fn query(self: *Response) !Query {
         const domain = try self.domainName(&self.domain_buf[0]);
         const query_type: QueryType = @fromBackingInt(@intCast(try self.r.takeInt(u16, .big)));
@@ -183,6 +170,7 @@ pub const Response = struct {
         else
             try self.r.take(len);
         self.remaining_answers -= 1;
+        //std.debug.print("answer domain: {s}\n", .{domain});
         return .{
             .domain = domain,
             .query_type = query_type,
@@ -191,30 +179,17 @@ pub const Response = struct {
             .addr = addr,
         };
     }
-
-    pub fn validate(self: *Response, transaction_id: u16, domain: []const u8) !void {
-        const h = try self.header();
-        if (h.transaction_id != transaction_id) return error.TransactionId;
-        if (h.err()) |err| return err;
-        if (h.answer_count == 0) return error.NoData;
-        if (h.query_count != 1) return error.MissingQuery;
-
-        const q = try self.query();
-        if (!std.mem.eql(u8, q.domain, domain)) return error.InvalidQueryDomain;
-    }
 };
 
 test "dns response " {
-    var r = Response.init(testdata.answer);
+    var r = try Response.init(testdata.answer);
 
-    const h = try r.header();
-    try testing.expectEqual(0x6af8, h.transaction_id);
-    try testing.expectEqual(1, h.query_count);
-    try testing.expectEqual(8, h.answer_count);
-    try testing.expectEqual(0, h.record_count);
-    try testing.expectEqual(1, h.additional_count);
-    try testing.expectEqual(Flags{ .qr = 1, .ra = 1, .rd = 1 }, h.flags);
-    try testing.expectEqual(null, h.err());
+    try testing.expectEqual(0x6af8, r.transaction_id);
+    try testing.expectEqual(1, r.query_count);
+    try testing.expectEqual(8, r.answer_count);
+    try testing.expectEqual(0, r.record_count);
+    try testing.expectEqual(1, r.additional_count);
+    try testing.expectEqual(Flags{ .qr = 1, .ra = 1, .rd = 1 }, r.flags);
 
     const q = try r.query();
     try testing.expectEqualStrings("www.google.com", q.domain);
@@ -236,16 +211,14 @@ test "dns response " {
 }
 
 test "cname answer" {
-    var r = Response.init(testdata.answer_with_cname);
+    var r = try Response.init(testdata.answer_with_cname);
 
-    const h = try r.header();
-    try testing.expectEqual(1, h.transaction_id);
-    try testing.expectEqual(1, h.query_count);
-    try testing.expectEqual(2, h.answer_count);
-    try testing.expectEqual(0, h.record_count);
-    try testing.expectEqual(1, h.additional_count);
-    try testing.expectEqual(Flags{ .qr = 1, .ra = 1, .rd = 1 }, h.flags);
-    try testing.expectEqual(null, h.err());
+    try testing.expectEqual(1, r.transaction_id);
+    try testing.expectEqual(1, r.query_count);
+    try testing.expectEqual(2, r.answer_count);
+    try testing.expectEqual(0, r.record_count);
+    try testing.expectEqual(1, r.additional_count);
+    try testing.expectEqual(Flags{ .qr = 1, .ra = 1, .rd = 1 }, r.flags);
 
     const q = try r.query();
     try testing.expectEqualStrings("gmail.google.com", q.domain);
@@ -264,17 +237,15 @@ test "cname answer" {
     try testing.expectEqual(60, a.ttl);
 }
 
-test "cname answer2" {
-    var r = Response.init(testdata.answer_with_two_label_compressions);
+test "cname answer with two level label compression" {
+    var r = try Response.init(testdata.answer_with_two_label_compressions);
 
-    const h = try r.header();
-    try testing.expectEqual(1, h.transaction_id);
-    try testing.expectEqual(1, h.query_count);
-    try testing.expectEqual(2, h.answer_count);
-    try testing.expectEqual(0, h.record_count);
-    try testing.expectEqual(1, h.additional_count);
-    try testing.expectEqual(Flags{ .qr = 1, .ra = 1, .rd = 1 }, h.flags);
-    try testing.expectEqual(null, h.err());
+    try testing.expectEqual(1, r.transaction_id);
+    try testing.expectEqual(1, r.query_count);
+    try testing.expectEqual(2, r.answer_count);
+    try testing.expectEqual(0, r.record_count);
+    try testing.expectEqual(1, r.additional_count);
+    try testing.expectEqual(Flags{ .qr = 1, .ra = 1, .rd = 1 }, r.flags);
 
     const q = try r.query();
     try testing.expectEqualStrings("gmail.google.com", q.domain);
@@ -303,7 +274,6 @@ const testdata = struct {
     const query = &hexToBytes(
         \\ 6a f8 01 00 00 01 00 00 00 00 00 01 03 77 77 77
         \\ 06 67 6f 6f 67 6c 65 03 63 6f 6d 00 00 01 00 01
-        \\ 00 00 29 05 c0 00 00 00 00 00 00
     );
     const answer = &hexToBytes(
         \\ 6a f8 81 80 00 01 00 08 00 00 00 01 03 77 77 77
