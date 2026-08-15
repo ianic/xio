@@ -406,8 +406,6 @@ pub fn io(ev: *Evented) Io {
             .netListenUnix = netListenUnixUnavailable,
             .netConnectUnix = netConnectUnixUnavailable,
             .netSocketCreatePair = netSocketCreatePairUnavailable,
-            .netSend = netSend,
-            .netWrite = netWrite,
             .netWriteFile = netWriteFile,
             .netClose = netClose,
             .netShutdown = netShutdown,
@@ -1388,6 +1386,24 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
         .device_io_control => |o| .{
             .device_io_control = try ev.deviceIoControl(o),
         },
+        .net_send => |o| .{
+            .net_send = r: {
+                const opt_err, const n = ev.netSend(o.socket_handle, o.messages, o.flags);
+                break :r .{
+                    if (opt_err) |err| switch (err) {
+                        error.Canceled => |e| return e,
+                        else => |e| e,
+                    } else null,
+                    n,
+                };
+            },
+        },
+        .net_write => |o| .{
+            .net_write = ev.netWrite(o.socket_handle, o.header, o.data, o.splat) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| e,
+            },
+        },
         .net_receive => |o| .{
             .net_receive = r: {
                 const opt_err, const n = ev.netReceive(o.socket_handle, o.message_buffer, o.data_buffer, o.flags);
@@ -1634,6 +1650,14 @@ fn batchDrainSubmitted(
                 _ = o;
                 @panic("TODO implement batchDrainSubmitted for net_read");
             },
+            .net_send => |o| {
+                _ = o;
+                @panic("TODO implement");
+            },
+            .net_write => |o| {
+                _ = o;
+                @panic("TODO implement");
+            },
         })) |result| {
             switch (batch.completed.tail) {
                 .none => batch.completed.head = index,
@@ -1741,6 +1765,8 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
                 .device_io_control => unreachable,
                 .net_receive => @panic("TODO"),
                 .net_read => @panic("TODO"),
+                .net_send => @panic("TODO"),
+                .net_write => @panic("TODO"),
             })) |result| {
                 switch (batch.completed.tail) {
                     .none => batch.completed.head = index,
@@ -3936,13 +3962,11 @@ fn netSocketCreatePairUnavailable(
 }
 
 fn netSend(
-    userdata: ?*anyopaque,
+    ev: *Evented,
     handle: net.Socket.Handle,
     messages: []net.OutgoingMessage,
     flags: net.SendFlags,
 ) struct { ?net.Socket.SendError, usize } {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-
     const linux_flags: u32 =
         @as(u32, if (flags.confirm) linux.MSG.CONFIRM else 0) |
         @as(u32, if (flags.dont_route) linux.MSG.DONTROUTE else 0) |
@@ -4068,6 +4092,7 @@ fn netReceiveTimeout(
             .PIPE => return .{ error.SocketUnconnected, message_i },
             .OPNOTSUPP => |err| return .{ errnoBug(err), message_i },
             .CONNRESET => return .{ error.ConnectionResetByPeer, message_i },
+            .TIMEDOUT => return .{ error.ConnectionTimedOut, message_i },
             .NETDOWN => return .{ error.NetworkDown, message_i },
             else => |err| return .{ unexpectedErrno(err), message_i },
         }
@@ -4086,13 +4111,12 @@ fn netRead(
 }
 
 fn netWrite(
-    userdata: ?*anyopaque,
+    ev: *Evented,
     handle: net.Socket.Handle,
     header: []const u8,
     data: []const []const u8,
     splat: usize,
 ) net.Stream.Writer.Error!usize {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
     var iovecs: [max_iovecs_len]iovec_const = undefined;
     const iov = fillIovecs(&iovecs, header, data, splat);
     var msg: linux.msghdr_const = .{
@@ -4137,9 +4161,9 @@ fn netWriteFile(
     return n;
 }
 
-fn netClose(userdata: ?*anyopaque, handles: []const net.Socket.Handle) void {
+fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    for (handles) |handle| ev.close(handle);
+    for (sockets) |sock| ev.close(sock.handle);
 }
 
 fn netShutdown(
@@ -4394,6 +4418,7 @@ fn bind(
         switch (fiber.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
+            .ACCES => return error.AccessDenied,
             .ADDRINUSE => return error.AddressInUse,
             .BADF => |err| return errnoBug(err), // File descriptor used after closed.
             .INVAL => |err| return errnoBug(err), // invalid parameters
