@@ -21,7 +21,7 @@ pub fn query(
         try w.writeInt(u16, 1, .big);
         try w.writeInt(u16, 0, .big);
         try w.writeInt(u16, 0, .big);
-        try w.writeInt(u16, 1, .big);
+        try w.writeInt(u16, 0, .big);
     }
     { // query section
         var pos: usize = 0;
@@ -272,7 +272,7 @@ test "dns query" {
 
 const testdata = struct {
     const query = &hexToBytes(
-        \\ 6a f8 01 00 00 01 00 00 00 00 00 01 03 77 77 77
+        \\ 6a f8 01 00 00 01 00 00 00 00 00 00 03 77 77 77
         \\ 06 67 6f 6f 67 6c 65 03 63 6f 6d 00 00 01 00 01
     );
     const answer = &hexToBytes(

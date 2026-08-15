@@ -520,12 +520,10 @@ test "dns io" {
         .concurrent_limit = .limited(2),
     });
     defer threaded.deinit();
-    //const io = threaded.io();
 
     var ev: Evented = undefined;
     try ev.init(gpa, .{});
     defer ev.deinit();
-    // const io = ev.io();
 
     const host = "www.google.com";
     //const host = "trinitymedia.ai";
@@ -556,6 +554,72 @@ test "dns io" {
                 },
             }
         }
+    }
+}
+
+test "dns lookup /etc/hosts" {
+    const gpa = testing.allocator;
+
+    var threaded = Io.Threaded.init(gpa, .{
+        .async_limit = .limited(2),
+        .concurrent_limit = .limited(2),
+    });
+    defer threaded.deinit();
+
+    var ev: Evented = undefined;
+    try ev.init(gpa, .{});
+    defer ev.deinit();
+
+    const host = "nas";
+    const expected = try Io.net.IpAddress.parseIp4("192.168.190.250", 81);
+
+    for ([_]Io{ threaded.io(), ev.io() }) |io| {
+        const host_name = try Io.net.HostName.init(host);
+        var canonical_name_buffer: [Io.net.HostName.max_len]u8 = undefined;
+        const port: u16 = 81;
+        var lookup_buffer: [2]Io.net.HostName.LookupResult = undefined;
+        var lookup_queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+        try host_name.lookup(io, &lookup_queue, .{
+            .port = port,
+            .canonical_name_buffer = &canonical_name_buffer,
+            .family = .ip4,
+        });
+
+        const res = try lookup_queue.getOne(io);
+        try testing.expect(res.address.eql(&expected));
+    }
+}
+
+test "dns lookup ip" {
+    const gpa = testing.allocator;
+
+    var threaded = Io.Threaded.init(gpa, .{
+        .async_limit = .limited(2),
+        .concurrent_limit = .limited(2),
+    });
+    defer threaded.deinit();
+
+    var ev: Evented = undefined;
+    try ev.init(gpa, .{});
+    defer ev.deinit();
+
+    const host = "192.168.190.250";
+    const expected = try Io.net.IpAddress.parseIp4("192.168.190.250", 82);
+
+    for ([_]Io{ threaded.io(), ev.io() }) |io| {
+        const host_name = try Io.net.HostName.init(host);
+        var canonical_name_buffer: [Io.net.HostName.max_len]u8 = undefined;
+        const port: u16 = 82;
+        var lookup_buffer: [2]Io.net.HostName.LookupResult = undefined;
+        var lookup_queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+        try host_name.lookup(io, &lookup_queue, .{
+            .port = port,
+            .canonical_name_buffer = &canonical_name_buffer,
+            .family = .ip4,
+        });
+
+        const res = try lookup_queue.getOne(io);
+        try testing.expect(res.address.eql(&expected));
     }
 }
 

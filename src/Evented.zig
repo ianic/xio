@@ -42,6 +42,8 @@ const std = @import("std");
 const timestampFromPosix = Io.Threaded.timestampFromPosix;
 const unexpectedErrno = std.posix.unexpectedErrno;
 const winsize = std.posix.winsize;
+const IpAddress = net.IpAddress;
+const HostName = net.HostName;
 
 /// Empirically saw >128KB being used by the self-hosted backend to panic.
 /// Empirically saw glibc complain about 256KB.
@@ -411,7 +413,7 @@ pub fn io(ev: *Evented) Io {
             .netShutdown = netShutdown,
             .netInterfaceNameResolve = netInterfaceNameResolveUnavailable,
             .netInterfaceName = netInterfaceNameUnavailable,
-            .netLookup = netLookupUnavailable,
+            .netLookup = netLookup,
         },
     };
 }
@@ -3837,9 +3839,9 @@ fn randomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
 
 fn netListenIp(
     userdata: ?*anyopaque,
-    address: *const net.IpAddress,
-    options: net.IpAddress.ListenOptions,
-) net.IpAddress.ListenError!net.Socket {
+    address: *const IpAddress,
+    options: IpAddress.ListenOptions,
+) IpAddress.ListenError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const family = posixAddressFamily(address);
     const socket_fd = try ev.socket(family, .{ .mode = options.mode, .protocol = options.protocol });
@@ -3897,9 +3899,9 @@ fn netAccept(
 
 fn netBindIp(
     userdata: ?*anyopaque,
-    address: *const net.IpAddress,
-    options: net.IpAddress.BindOptions,
-) net.IpAddress.BindError!net.Socket {
+    address: *const IpAddress,
+    options: IpAddress.BindOptions,
+) IpAddress.BindError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const family = posixAddressFamily(address);
     const socket_fd = try ev.socket(family, options);
@@ -3915,9 +3917,9 @@ fn netBindIp(
 
 fn netConnectIp(
     userdata: ?*anyopaque,
-    address: *const net.IpAddress,
-    options: net.IpAddress.ConnectOptions,
-) net.IpAddress.ConnectError!net.Socket {
+    address: *const IpAddress,
+    options: IpAddress.ConnectOptions,
+) IpAddress.ConnectError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const family = posixAddressFamily(address);
     const socket_fd = try ev.socket(family, .{ .mode = options.mode, .protocol = options.protocol });
@@ -4211,41 +4213,94 @@ fn netInterfaceNameUnavailable(
     return error.Unexpected;
 }
 
-fn netLookupUnavailable(
+fn netLookup(
     userdata: ?*anyopaque,
-    host_name: net.HostName,
-    resolved: *Io.Queue(net.HostName.LookupResult),
-    options: net.HostName.LookupOptions,
-) net.HostName.LookupError!void {
+    host_name: HostName,
+    resolved: *Io.Queue(HostName.LookupResult),
+    options: HostName.LookupOptions,
+) HostName.LookupError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     defer resolved.close(ev.io());
-    ev.netLookup(host_name, resolved, options) catch |err| switch (err) {
+    ev.netLookupFallible(host_name, resolved, options) catch |err| switch (err) {
         error.WriteFailed => return error.Unexpected, // query writer failed
         error.Closed => unreachable, // `resolved` must not be closed until `netLookup` returns
         else => |e| return e,
     };
 }
 
-fn netLookup(
+fn netLookupFallible(
     ev: *Evented,
-    host_name: net.HostName,
-    resolved: *Io.Queue(net.HostName.LookupResult),
-    options: net.HostName.LookupOptions,
+    host_name: HostName,
+    resolved: *Io.Queue(HostName.LookupResult),
+    options: HostName.LookupOptions,
 ) !void {
-    var rc: Io.net.HostName.ResolvConf = undefined;
-    //Io.net.IpAddress.parse("192.168.190.1", 53) catch unreachable,
-    rc.nameservers_buffer[0] = Io.net.IpAddress.parse("1.1.1.1", 53) catch unreachable;
-    rc.nameservers_buffer[1] = Io.net.IpAddress.parse("8.8.8.8", 53) catch unreachable;
-    rc.nameservers_buffer[2] = Io.net.IpAddress.parse("1.0.0.1", 53) catch unreachable;
-    rc.nameservers_len = 3;
-    rc.attempts = 2;
-    rc.timeout_seconds = 5;
-
-    const dns = @import("dns.zig");
-    const max_messages = Io.net.HostName.ResolvConf.max_nameservers * 2;
     const ev_io = ev.io();
+    const dns = @import("dns.zig");
     const domain = host_name.bytes;
 
+    // Check if domain is valid IpAddress
+    if (IpAddress.parseIp6(domain, options.port)) |addr| {
+        if (options.family == .ip4) return error.UnknownHostName;
+        if (copyCanon(options.canonical_name_buffer, domain)) |canon| {
+            try resolved.putAll(ev_io, &.{
+                .{ .address = addr },
+                .{ .canonical_name = canon },
+            });
+        } else {
+            try resolved.putOne(ev_io, .{ .address = addr });
+        }
+        return;
+    } else |_| {}
+    if (IpAddress.parseIp4(domain, options.port)) |addr| {
+        if (options.family == .ip6) return error.UnknownHostName;
+        if (copyCanon(options.canonical_name_buffer, domain)) |canon| {
+            try resolved.putAll(ev_io, &.{
+                .{ .address = addr },
+                .{ .canonical_name = canon },
+            });
+        } else {
+            try resolved.putOne(ev_io, .{ .address = addr });
+        }
+        return;
+    } else |_| {}
+
+    // Try to find host_name in /etc/hosts
+    if (ev.lookupHosts(host_name, resolved, options)) {
+        return; // found
+    } else |err| switch (err) {
+        error.UnknownHostName => {},
+        else => |e| return e,
+    }
+
+    // Check for equal to "localhost(.)" or ends in ".localhost(.)"
+    const localhost = if (domain[domain.len - 1] == '.') "localhost." else "localhost";
+    if (std.mem.endsWith(u8, domain, localhost) and
+        (domain.len == localhost.len or domain[domain.len - localhost.len - 1] == '.'))
+    {
+        var results_buffer: [3]HostName.LookupResult = undefined;
+        var results_index: usize = 0;
+        if (options.family != .ip4) {
+            results_buffer[results_index] = .{ .address = .{ .ip6 = .loopback(options.port) } };
+            results_index += 1;
+        }
+        if (options.family != .ip6) {
+            results_buffer[results_index] = .{ .address = .{ .ip4 = .loopback(options.port) } };
+            results_index += 1;
+        }
+        if (options.canonical_name_buffer) |buf| {
+            const canon_name = "localhost";
+            const canon_name_dest = buf[0..canon_name.len];
+            canon_name_dest.* = canon_name.*;
+            results_buffer[results_index] = .{ .canonical_name = .{ .bytes = canon_name_dest } };
+            results_index += 1;
+        }
+        try resolved.putAll(ev_io, results_buffer[0..results_index]);
+        return;
+    }
+
+    // Find resolver(s) and make queries
+    const rc = HostName.ResolvConf.init(ev_io) catch return error.ResolvConfParseFailed;
+    const max_messages = HostName.ResolvConf.max_nameservers * 2;
     // Prepare queries
     var queries_buffer: [2]struct {
         data_buffer: [dns.max_query_len]u8 = undefined,
@@ -4262,7 +4317,7 @@ fn netLookup(
         var n: usize = 0;
         var entropy: [4]u8 = undefined;
         random(ev, &entropy);
-        for ([_]net.IpAddress.Family{ .ip4, .ip6 }) |family| {
+        for ([_]IpAddress.Family{ .ip4, .ip6 }) |family| {
             if (options.family == null or options.family.? == family) {
                 const query = &queries_buffer[n];
                 query.transaction_id = std.mem.readInt(u16, entropy[n * 2 ..][0..2], .big);
@@ -4273,7 +4328,7 @@ fn netLookup(
         break :brk queries_buffer[0..n];
     };
 
-    const bind_addr: Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
+    const bind_addr: IpAddress = .{ .ip4 = .unspecified(0) };
     const bind_socket = try netBindIp(ev, &bind_addr, .{ .mode = .dgram, .protocol = .udp });
     defer ev.closeAsync(bind_socket.handle);
 
@@ -4972,7 +5027,7 @@ fn setsockopt(
 fn socket(
     ev: *Evented,
     family: linux.sa_family_t,
-    options: net.IpAddress.BindOptions,
+    options: IpAddress.BindOptions,
 ) error{
     AddressFamilyUnsupported,
     ProtocolUnsupportedBySystem,
@@ -5456,4 +5511,117 @@ fn errnoToError(comptime ErrorSet: type, errno: linux.E) ErrorSet {
 
 test {
     _ = Fiber.CancelProtection;
+}
+
+fn lookupHosts(
+    ev: *Evented,
+    host_name: HostName,
+    resolved: *Io.Queue(HostName.LookupResult),
+    options: HostName.LookupOptions,
+) !void {
+    const file = dirOpenFile(ev, .cwd(), "/etc/hosts", .{}) catch |err| switch (err) {
+        error.FileNotFound,
+        error.NotDir,
+        error.AccessDenied,
+        => return error.UnknownHostName,
+
+        error.Canceled => |e| return e,
+
+        else => {
+            // Here we could add more detailed diagnostics to the results queue.
+            return error.DetectingNetworkConfigurationFailed;
+        },
+    };
+
+    defer fileClose(ev, &.{file});
+
+    var line_buf: [512]u8 = undefined;
+    var file_reader = file.reader(ev.io(), &line_buf);
+    return ev.lookupHostsReader(host_name, resolved, options, &file_reader.interface) catch |err| switch (err) {
+        error.ReadFailed => switch (file_reader.err.?) {
+            error.Canceled => |e| return e,
+            else => {
+                // Here we could add more detailed diagnostics to the results queue.
+                return error.DetectingNetworkConfigurationFailed;
+            },
+        },
+        error.Canceled,
+        error.Closed,
+        error.UnknownHostName,
+        => |e| return e,
+    };
+}
+
+fn lookupHostsReader(
+    ev: *Evented,
+    host_name: HostName,
+    resolved: *Io.Queue(HostName.LookupResult),
+    options: HostName.LookupOptions,
+    reader: *Io.Reader,
+) error{ ReadFailed, Canceled, UnknownHostName, Closed }!void {
+    const t_io = io(ev);
+    var addresses_len: usize = 0;
+    var canonical_name: ?HostName = null;
+    while (true) {
+        const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.StreamTooLong => {
+                // Skip lines that are too long.
+                _ = reader.discardDelimiterInclusive('\n') catch |er| switch (er) {
+                    error.EndOfStream => break,
+                    error.ReadFailed => |e| return e,
+                };
+                continue;
+            },
+            error.ReadFailed => |e| return e,
+            error.EndOfStream => break,
+        };
+        reader.toss(@min(1, reader.bufferedLen()));
+        var split_it = std.mem.splitScalar(u8, line, '#');
+        const no_comment_line = split_it.first();
+
+        var line_it = std.mem.tokenizeAny(u8, no_comment_line, " \t");
+        const ip_text = line_it.next() orelse continue;
+        var first_name_text: ?[]const u8 = null;
+        while (line_it.next()) |name_text| {
+            if (std.ascii.eqlIgnoreCase(name_text, host_name.bytes)) {
+                if (first_name_text == null) first_name_text = name_text;
+                break;
+            }
+        } else continue;
+
+        if (canonical_name == null) {
+            if (options.canonical_name_buffer) |buf| {
+                if (HostName.init(first_name_text.?)) |name_text| {
+                    if (name_text.bytes.len <= buf.len) {
+                        const canonical_name_dest = buf[0..name_text.bytes.len];
+                        @memcpy(canonical_name_dest, name_text.bytes);
+                        canonical_name = .{ .bytes = canonical_name_dest };
+                    }
+                } else |_| {}
+            }
+        }
+
+        if (options.family != .ip6) {
+            if (IpAddress.parseIp4(ip_text, options.port)) |addr| {
+                try resolved.putOne(t_io, .{ .address = addr });
+                addresses_len += 1;
+            } else |_| {}
+        }
+        if (options.family != .ip4) {
+            if (IpAddress.parseIp6(ip_text, options.port)) |addr| {
+                try resolved.putOne(t_io, .{ .address = addr });
+                addresses_len += 1;
+            } else |_| {}
+        }
+    }
+
+    if (canonical_name) |canon_name| try resolved.putOne(t_io, .{ .canonical_name = canon_name });
+    if (addresses_len == 0) return error.UnknownHostName;
+}
+
+fn copyCanon(canonical_name_buffer: ?*[HostName.max_len]u8, name: []const u8) ?HostName {
+    const buf = canonical_name_buffer orelse return null;
+    const dest = buf[0..name.len];
+    @memcpy(dest, name);
+    return .{ .bytes = dest };
 }
