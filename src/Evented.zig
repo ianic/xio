@@ -5387,6 +5387,7 @@ fn errnoToError(comptime ErrorSet: type, errno: linux.E) ErrorSet {
             .NOMEM => error.SystemResources,
             .NOTCONN => error.SocketUnconnected,
             .PIPE => error.SocketUnconnected,
+            .TIMEDOUT => return error.ConnectionTimedOut,
             .ACCES => |err| errnoBug(err),
             .AGAIN => |err| errnoBug(err),
             .BADF => |err| errnoBug(err), // File descriptor used after closed.
@@ -5429,6 +5430,7 @@ fn errnoToError(comptime ErrorSet: type, errno: linux.E) ErrorSet {
             .NOMEM => error.SystemResources,
             .NOTCONN => error.SocketUnconnected,
             .PIPE => error.SocketUnconnected,
+            .TIMEDOUT => return error.ConnectionTimedOut,
             .BADF => |err| errnoBug(err), // File descriptor used after closed.
             .DESTADDRREQ => |err| errnoBug(err),
             .FAULT => |err| errnoBug(err),
@@ -5475,6 +5477,7 @@ fn errnoToError(comptime ErrorSet: type, errno: linux.E) ErrorSet {
             .CONNRESET => error.ConnectionResetByPeer,
             .PIPE => error.SocketUnconnected,
             .NETDOWN => error.NetworkDown,
+            .TIMEDOUT => return error.ConnectionTimedOut,
             else => |err| unexpectedErrno(err),
         },
         FilePathStatError, File.StatError => switch (errno) {
