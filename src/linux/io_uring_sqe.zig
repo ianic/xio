@@ -600,7 +600,6 @@ pub const Sqe = extern struct {
     ) void {
         sqe.* = .{
             .opcode = .futex_wake,
-            .flags = .{ .cqe_skip_success = true },
             .fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true }),
             .a = .{ .offset = max_waiters },
             .b = .{ .addr = @intFromPtr(ptr) },

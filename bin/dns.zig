@@ -5,71 +5,98 @@ const mem = std.mem;
 const xio = @import("xio");
 
 pub fn main(init: std.process.Init) !void {
+    // var threaded = Io.Threaded.init(init.gpa, .{
+    //     .async_limit = .limited(2),
+    //     .concurrent_limit = .limited(2),
+    // });
+    // defer threaded.deinit();
+    // const io = threaded.io();
+
     var evented: xio.Evented = undefined;
     try evented.init(init.gpa, .{});
     defer evented.deinit();
     const io = evented.io();
 
-    var bind_addr = try std.Io.net.IpAddress.parse("0.0.0.0", 0);
-    const socket = try bind_addr.bind(io, .{ .mode = .dgram, .protocol = .udp });
-
-    const dns_addr = try std.Io.net.IpAddress.parse("192.168.190.1", 53);
-
-    // const domains = [_][]const u8{
-    //     "gmail.google.com",
-    // };
-
-    for (all_domains, 1..) |domain, transaction_id| {
-        std.debug.print("{s}\n", .{domain});
-        do(io, dns_addr, socket, @intCast(transaction_id), domain) catch |err| {
-            std.debug.print("{}\n", .{err});
-        };
-        std.debug.print("\n", .{});
+    // jedna po jedna
+    for (all_domains) |domain| {
+        var f = io.async(run, .{ io, domain });
+        f.await(io);
     }
+
+    // var i: usize = 0;
+    // const Result = union(enum) {
+    //     a: anyerror!void,
+    //     b: anyerror!void,
+    // };
+    // var results: [2]Result = undefined;
+    // var select = Io.Select(Result).init(io, &results);
+    // defer _ = select.cancel();
+    // try select.concurrent(.a, do, .{ io, all_domains[i] });
+    // try select.concurrent(.b, do, .{ io, all_domains[i + 1] });
+    // i = 2;
+    // while (i < all_domains.len) {
+    //     std.debug.print("wait {}\n", .{i});
+    //     switch (try select.await()) {
+    //         .a => {
+    //             std.debug.print("a starting {s}\n", .{all_domains[i]});
+    //             try select.concurrent(.a, do, .{ io, all_domains[i] });
+    //         },
+    //         .b => {
+    //             std.debug.print("b starting {s}\n", .{all_domains[i]});
+    //             try select.concurrent(.b, do, .{ io, all_domains[i] });
+    //         },
+    //     }
+    //     i += 1;
+    // }
+
+    // Grupa, ali moram cekati da svi u grupi zavrse da bi pokrenuo novu grupu
+    // var group: Io.Group = .init;
+    // for (all_domains, 0..) |domain, no| {
+    //     if (no % 128 == 0) {
+    //         try group.await(io);
+    //         group = .init;
+    //     }
+    //     group.async(io, run, .{ io, domain });
+    // }
+    // try group.await(io);
+}
+
+fn run(io: Io, domain: []const u8) void {
+    do(io, domain) catch |err| {
+        std.debug.print("{s} {}\n", .{ domain, err });
+    };
 }
 
 pub fn do(
     io: Io,
-    dns_addr: Io.net.IpAddress,
-    socket: Io.net.Socket,
-    transaction_id: u16,
     domain: []const u8,
 ) !void {
-    var buf: [xio.dns.udp_payload_size]u8 = undefined;
-    const query = try xio.dns.query(&buf, transaction_id, domain);
-    try socket.send(io, &dns_addr, query);
+    var canonical_name_buffer: [Io.net.HostName.max_len]u8 = undefined;
+    var lookup_buffer: [32]Io.net.HostName.LookupResult = undefined;
+    var lookup_queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&lookup_buffer);
 
-    const msg = try socket.receive(io, &buf);
-    var rsp = xio.dns.Response.init(msg.data);
+    const host_name = try Io.net.HostName.init(domain);
+    try host_name.lookup(io, &lookup_queue, .{
+        .port = 80,
+        .canonical_name_buffer = &canonical_name_buffer,
+        //.family = .ip6,
+    });
 
-    const h = try rsp.header();
-    if (h.transaction_id != transaction_id) return error.InvalidTransactionId;
-    if (h.err()) |err| return err;
-    if (h.answer_count == 0) return error.NoData;
-    if (h.query_count != 1) return error.MissingQuery;
-
-    const q = try rsp.query();
-    if (!mem.eql(u8, q.domain, domain)) return error.InvalidQueryDomain;
-    //std.debug.print("query: {}\n", .{q});
-
-    while (try rsp.answer()) |a| {
-        switch (a.query_type) {
-            .a => {
-                //if (!mem.eql(u8, q.domain, domain)) return error.InvalidAnswerDomain;
-                std.debug.print("A: {s} ", .{a.domain});
-                for (a.addr, 0..) |b, i| {
-                    std.debug.print("{d}", .{b});
-                    if (i < 3) std.debug.print(".", .{}) else std.debug.print("\n", .{});
-                }
-            },
-            .cname => {
-                std.debug.print("CNAME: {s} => {s}\n", .{ a.domain, a.addr });
-            },
-            else => {
-                std.debug.print("answer: {}\n", .{a});
-            },
-        }
-    }
+    std.debug.print("{s}\n", .{domain});
+    // while (true) {
+    //     const res = lookup_queue.getOne(io) catch |err| switch (err) {
+    //         error.Closed => break,
+    //         else => |e| return e,
+    //     };
+    //     switch (res) {
+    //         .address => |a| {
+    //             std.debug.print("\taddress: {}\n", .{a});
+    //         },
+    //         .canonical_name => |c| {
+    //             std.debug.print("\tcname: {s}\n", .{c.bytes});
+    //         },
+    //     }
+    // }
 }
 
 const all_domains = [_][]const u8{
@@ -6353,3 +6380,5 @@ const all_domains = [_][]const u8{
     "zwyr157wwiu6eior.com",
     "zynga.com",
 };
+
+test "select explain" {}
