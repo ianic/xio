@@ -4157,7 +4157,10 @@ fn netWriteFile(
         &n,
     ) catch |err| {
         if (n > 0) return n;
-        return err;
+        return switch (err) {
+            error.BrokenPipe => error.ConnectionResetByPeer,
+            else => |e| e,
+        };
     };
     return n;
 }
@@ -5255,7 +5258,7 @@ fn sendfile(
     fd_out: linux.fd_t,
     count: usize,
     sent: *usize,
-) error{ SystemResources, Unexpected, Canceled }!void {
+) error{ SystemResources, BrokenPipe, Unexpected, Canceled }!void {
     const pipe = ev.pipe2(.{ .NONBLOCK = true }) catch |err| switch (err) {
         error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => return error.SystemResources,
         else => |e| return e,
@@ -5288,7 +5291,7 @@ fn splice(
     fd_out: fd_t,
     off_out: u64,
     len: u32,
-) error{ SystemResources, Unexpected, Canceled }!u32 {
+) error{ SystemResources, BrokenPipe, Unexpected, Canceled }!u32 {
     const splice_f_nonblock = 0x02;
     while (true) {
         const sqe, const fiber = try ev.enqueue();
@@ -5299,6 +5302,7 @@ fn splice(
             .SUCCESS => return @as(u32, @bitCast(completion.result)),
             .INTR => {},
             .NOMEM => return error.SystemResources,
+            .PIPE => return error.BrokenPipe,
             .BADF => |err| return errnoBug(err),
             .INVAL => |err| return errnoBug(err),
             .SPIPE => |err| return errnoBug(err),
