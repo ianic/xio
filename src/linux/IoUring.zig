@@ -472,12 +472,36 @@ pub const CompletionQueue = struct {
     cqes: []Cqe,
 
     pub const Entry = extern struct {
+        pub const Flags = packed struct(u32) {
+            /// If set, the upper 16 bits are the buffer ID
+            buffer: bool,
+            /// If set, parent SQE will generate more CQE entries.
+            /// Available since Linux 5.13.
+            more: bool,
+            /// If set, more data to read after socket recv
+            sock_nonempty: bool,
+            /// Set for notification CQEs. Can be used to distinct them from sends.
+            notif: bool,
+            /// If set, the buffer ID set in the completion will get more completions.
+            buf_more: bool,
+            /// If the ring has been configured with IORING_SETUP_CQE_MIXED, then
+            /// CQEs may be posted which has this flag set.
+            skip: bool,
+
+            _: u9 = 0,
+            /// If the ring has been configured with IORING_SETUP_CQE_MIXED,
+            /// this flag is set when the CQE is of the 32b type.
+            cqe32: bool,
+
+            buffer_id: u16,
+        };
+
         /// io_uring_sqe.data submission passed back
         user_data: u64,
 
         /// result code for this event
         res: i32,
-        flags: u32,
+        flags: Flags,
 
         pub fn err(self: Entry) linux.E {
             if (self.res > -4096 and self.res < 0) {

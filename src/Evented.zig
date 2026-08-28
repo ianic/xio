@@ -596,7 +596,7 @@ fn schedule(ev: *Evented, ready_queue: Fiber.Queue) void {
 
 const Completion = struct {
     result: i32,
-    flags: u32,
+    flags: IoUring.Cqe.Flags,
 
     const Userdata = enum(usize) {
         unused,
@@ -682,7 +682,7 @@ fn idle(ev: *Evented) void {
             var cqes_buffer: [1 << 8]IoUring.Cqe = undefined;
             const cqes = cqes_buffer[0..ev.io_uring.copyReadyCqes(&cqes_buffer)];
             if (cqes.len == 0) break;
-            for (cqes) |cqe| if (cqe.flags & linux.IORING_CQE_F_SKIP == 0) switch (@as(
+            for (cqes) |cqe| if (!cqe.flags.skip) switch (@as(
                 Completion.Userdata,
                 @fromBackingInt(@intCast(cqe.user_data)),
             )) {
@@ -723,7 +723,7 @@ fn idle(ev: *Evented) void {
 
                         // batch.userdata holds pointer to the completed operation or batch fiber
                         const next = batch_userdata.*;
-                        pending_userdata[0..3].* = .{ next, @as(u32, @bitCast(cqe.res)), cqe.flags };
+                        pending_userdata[0..3].* = .{ next, @as(u32, @bitCast(cqe.res)), @backingInt(cqe.flags) };
                         batch_userdata.* = cqe.user_data;
 
                         break :ready_fiber switch (@as(u2, @truncate(next))) {
@@ -1706,9 +1706,8 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
             next = operation_userdata[0];
             const completion: Completion = .{
                 .result = @bitCast(@as(u32, @intCast(operation_userdata[1]))),
-                .flags = @intCast(operation_userdata[2]),
+                .flags = @bitCast(@as(u32, @intCast(operation_userdata[2]))),
             };
-            assert(completion.flags & linux.IORING_CQE_F_SKIP == 0);
 
             const pending: *Io.Operation.Storage.Pending =
                 @fieldParentPtr("userdata", operation_userdata);
