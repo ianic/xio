@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
         "server",
         "dns",
         "select",
+        "http",
     }) |name| {
         const bin = b.addExecutable(.{
             .name = name,
