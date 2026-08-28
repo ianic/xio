@@ -3864,12 +3864,17 @@ fn netAccept(
 ) net.Server.AcceptError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     options;
+    const soc = try ev.accept(listen_handle);
+    try ev.setsockopt(soc.handle, linux.IPPROTO.TCP, linux.TCP.NODELAY, 1);
+    return soc;
+}
 
+fn accept(ev: *Evented, fd: net.Socket.Handle) net.Server.AcceptError!net.Socket {
     while (true) {
         var storage: PosixAddress = undefined;
         var addr_len: linux.socklen_t = @sizeOf(PosixAddress);
         const sqe, const fiber = try ev.enqueue();
-        sqe.accept(@intFromPtr(fiber), listen_handle, @ptrCast(&storage), &addr_len, 0);
+        sqe.accept(@intFromPtr(fiber), fd, @ptrCast(&storage), &addr_len, 0);
         ev.yield(null, .nothing);
         const completion = fiber.completion();
         switch (completion.errno()) {
