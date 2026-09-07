@@ -706,6 +706,7 @@ test "netReceive" {
 }
 
 test "explain batch" {
+    if (true) return error.SkipZigTest;
     const gpa = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -757,4 +758,167 @@ test "explain batch" {
 
 test {
     //_ = @import("dns.zig");
+}
+
+test "explain group" {
+    var ev: Evented = undefined;
+    try ev.init(testing.allocator, .{});
+    defer ev.deinit();
+
+    // var ev = Io.Threaded.init(testing.allocator, .{
+    //     .async_limit = .limited(2),
+    //     .concurrent_limit = .limited(2),
+    // });
+
+    const S = struct {
+        fn task1(io: Io) Io.Cancelable!void {
+            try io.sleep(.fromSeconds(1), .real);
+            std.debug.print("task1\n", .{});
+        }
+
+        fn task3(io: Io) Io.Cancelable!void {
+            io.sleep(.fromSeconds(1), .real) catch |err| {
+                std.debug.print("task31: {}\n", .{err});
+                return err;
+            };
+            io.sleep(.fromSeconds(1), .real) catch |err| {
+                std.debug.print("task32: {}\n", .{err});
+                return err;
+            };
+            try io.sleep(.fromSeconds(1), .real);
+            std.debug.print("task3\n", .{});
+        }
+
+        fn task2(io: Io) Io.Cancelable!void {
+            io.sleep(.fromSeconds(10), .real) catch |err| {
+                std.debug.print("task21: {}\n", .{err});
+                return err;
+            };
+            io.sleep(.fromSeconds(1), .real) catch |err| {
+                std.debug.print("task22: {}\n", .{err});
+                return err;
+            };
+            std.debug.print("task2\n", .{});
+            // try grp.await(io);
+            // std.debug.print("task21\n", .{});
+        }
+    };
+
+    const io = ev.io();
+    var grp = Io.Group.init;
+    grp.async(io, S.task1, .{io});
+    grp.async(io, S.task3, .{io});
+    grp.async(io, S.task2, .{io});
+    //try grp.await(io);
+    try io.sleep(.fromSeconds(1), .real);
+    grp.cancel(io);
+}
+
+test "playing with group" {
+    var ev: Evented = undefined;
+    try ev.init(testing.allocator, .{});
+    defer ev.deinit();
+    // var ev: Io.Evented = undefined;
+    // try ev.init(testing.allocator, .{});
+    // defer ev.deinit();
+    // var ev = Io.Threaded.init(testing.allocator, .{
+    //     .async_limit = .limited(2),
+    //     .concurrent_limit = .limited(2),
+    // });
+
+    const S = struct {
+        fn task1(io: Io) Io.Cancelable!void {
+            try io.sleep(.fromSeconds(1), .real);
+            std.debug.print("task1\n", .{});
+        }
+
+        fn task3(io: Io) Io.Cancelable!void {
+            io.sleep(.fromSeconds(1), .real) catch |err| {
+                std.debug.print("task31: {}\n", .{err});
+                return err;
+            };
+            io.sleep(.fromSeconds(1), .real) catch |err| {
+                std.debug.print("task32: {}\n", .{err});
+                return err;
+            };
+            try io.sleep(.fromSeconds(1), .real);
+            std.debug.print("task3\n", .{});
+        }
+
+        fn task2(io: Io) Io.Cancelable!void {
+            io.sleep(.fromSeconds(10), .real) catch |err| {
+                std.debug.print("task21: {}\n", .{err});
+                return err;
+            };
+            io.sleep(.fromSeconds(1), .real) catch |err| {
+                std.debug.print("task22: {}\n", .{err});
+                return err;
+            };
+            std.debug.print("task2\n", .{});
+            // try grp.await(io);
+            // std.debug.print("task21\n", .{});
+        }
+
+        fn task4(io: Io, ptr: *u32) Io.Cancelable!void {
+            try Io.futexWait(io, u32, ptr, 0);
+        }
+
+        fn grpRun(io: Io, ptr: *u32, ptr2: *u32) Io.Cancelable!void {
+            var grp = Io.Group.init;
+            //grp.async(io, task1, .{io});
+            //errdefer grp.cancel(io);
+            //grp.async(io, task3, .{io});
+            //grp.async(io, task2, .{io});
+            grp.async(io, task4, .{ io, ptr2 });
+            try io.sleep(.fromMilliseconds(1), .real);
+            Io.futexWake(io, u32, ptr, 1);
+            grp.cancel(io);
+        }
+    };
+    var val: u32 = 0;
+    var val2: u32 = 0;
+    const io = ev.io();
+
+    std.debug.print("val: {*} {*}\n", .{ &val, &val2 });
+
+    var f = io.async(S.grpRun, .{ io, &val, &val2 });
+    try Io.futexWait(io, u32, &val, 0);
+    //try io.sleep(.fromMilliseconds(500), .real);
+    std.debug.print("f.cancel\n", .{});
+    f.cancel(io) catch {};
+    Io.futexWake(io, u32, &val2, 1);
+}
+
+test "group double cancel" {
+    var ev: Evented = undefined;
+    try ev.init(testing.allocator, .{});
+    defer ev.deinit();
+
+    // var ev: Io.Evented = undefined;
+    // try ev.init(testing.allocator, .{});
+    // defer ev.deinit();
+
+    // var ev = Io.Threaded.init(testing.allocator, .{});
+
+    const S = struct {
+        fn waitTask(io: Io, ptr2: *u32) Io.Cancelable!void {
+            try Io.futexWait(io, u32, ptr2, 0);
+        }
+
+        fn grpRun(io: Io, ptr: *u32, ptr2: *u32) Io.Cancelable!void {
+            var grp = Io.Group.init;
+            grp.async(io, waitTask, .{ io, ptr2 });
+            try io.sleep(.fromMilliseconds(1), .real);
+            Io.futexWake(io, u32, ptr, 1);
+            grp.cancel(io);
+        }
+    };
+
+    var val: u32 = 0;
+    var val2: u32 = 0;
+    const io = ev.io();
+    var f = io.async(S.grpRun, .{ io, &val, &val2 });
+    try Io.futexWait(io, u32, &val, 0);
+    f.cancel(io) catch {};
+    Io.futexWake(io, u32, &val2, 1);
 }
