@@ -259,7 +259,7 @@ const Fiber = struct {
             .operation => {
                 ev.getSqe().asyncCancel(
                     @backingInt(Completion.Userdata.wakeup),
-                    @intFromPtr(&fiber),
+                    @intFromPtr(fiber),
                 );
             },
         }
