@@ -3807,10 +3807,18 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
         .boot => linux.IORING_TIMEOUT_BOOTTIME,
     }));
     ev.yield(null, .nothing);
-    // Handles SUCCESS as well as clock not available and unexpected
-    // errors. The user had a chance to check clock resolution before
-    // getting here, which would have reported 0, making this a legal
-    // amount of time to sleep.
+    switch (fiber.errno()) {
+        .SUCCESS, .TIME => {},
+        .INTR => {},
+        .CANCELED => return error.Canceled,
+        .FAULT, .INVAL => |errno| {
+            const is_debug = builtin.mode == .debug;
+            if (is_debug) {
+                std.debug.panic("programmer bug caused syscall error: {t}", .{errno});
+            }
+        },
+        else => {},
+    }
 }
 
 fn random(userdata: ?*anyopaque, buffer: []u8) void {
