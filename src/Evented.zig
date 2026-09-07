@@ -1026,15 +1026,19 @@ const Group = struct {
         const list = ptr.*;
         if (fiber.link.group.next) |next| next.link.group.prev = fiber.link.group.prev;
         if (fiber.link.group.prev) |prev| {
+            // removed was somewhere in the list
             prev.link.group.next = fiber.link.group.next;
         } else if (fiber.link.group.next) |new_head| {
+            // removed was list head, and there is next
             ptr.* = .{
                 .cancel_requested = list.cancel_requested,
                 .awaiter_delayed = list.awaiter_delayed,
                 .fibers = .pack(new_head),
             };
         } else if (group.awaiterPtr().*.awaiter.unpack()) |awaiter| {
+            // removed was last fiber in the list and there is awaiter
             if (!awaiter.cancel_status.changeAwaiting(.group, .nothing) or list.cancel_requested) {
+                // awaiter is not canceled or list is canceled
                 ptr.* = .{
                     .cancel_requested = false,
                     .awaiter_delayed = false,
@@ -1044,12 +1048,15 @@ const Group = struct {
                 awaiter.status = .{ .queue_next = null };
                 return awaiter;
             }
+            // and awaiter is canceled
+            // TODO this is not possible in single threader mode, list.cancel_requested if awaiter is canceled !!!
             ptr.* = .{
                 .cancel_requested = false,
                 .awaiter_delayed = true,
                 .fibers = .null,
             };
         } else {
+            // removed was last fiber and there is no awaiter
             ptr.* = .{
                 .cancel_requested = false,
                 .awaiter_delayed = false,
@@ -1059,6 +1066,7 @@ const Group = struct {
         return null;
     }
 
+    // Returns true if there is nothing to wait for
     fn await(group: Group, ev: *Evented, awaiter: *Fiber) bool {
         const ptr = group.listPtr();
         const list = ptr.*;
@@ -1076,27 +1084,30 @@ const Group = struct {
     fn cancel(group: Group, ev: *Evented, maybe_awaiter: ?*Fiber) bool {
         const ptr = group.listPtr();
         const list = ptr.*;
-        assert(!list.cancel_requested);
-        ptr.* = .{
-            .cancel_requested = true,
-            .awaiter_delayed = false,
-            .fibers = list.fibers,
-        };
         if (list.fibers.unpack()) |head| {
+            // fibers list is not empty, cancel all fibers
+            ptr.* = .{
+                .cancel_requested = true,
+                .awaiter_delayed = list.awaiter_delayed,
+                .fibers = list.fibers,
+            };
             var maybe_fiber: ?*Fiber = head;
             while (maybe_fiber) |fiber| {
-                fiber.requestCancel(ev);
+                if (!fiber.cancel_status.requested) {
+                    fiber.requestCancel(ev);
+                }
                 maybe_fiber = fiber.link.group.next;
             }
             if (maybe_awaiter) |awaiter| _ = group.registerAwaiter(awaiter);
             return false;
         }
+        // group has no fibers, cleanup
         ptr.* = .{
             .cancel_requested = false,
             .awaiter_delayed = false,
             .fibers = .null,
         };
-        return if (maybe_awaiter) |_| true else list.awaiter_delayed;
+        return true;
     }
 
     fn registerAwaiter(group: Group, awaiter: *Fiber) bool {
