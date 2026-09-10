@@ -442,12 +442,12 @@ test "group" {
     defer tmp.cleanup();
     const dir = tmp.dir;
 
+    var grp: Io.Group = .init;
     {
         var task1: Task = .{};
         var task2: Task = .{};
         var task3: Task = .{};
 
-        var grp = Io.Group.init;
         grp.async(io, Task.createFile, .{ &task1, io, dir, ".." });
         grp.async(io, Task.createFile, .{ &task2, io, dir, "file2" });
         grp.async(io, Task.createFile, .{ &task3, io, dir, "file3" });
@@ -464,7 +464,6 @@ test "group" {
         var task2: Task = .{};
         var task3: Task = .{};
 
-        var grp = Io.Group.init;
         try testing.expect(evented.ready_queue == null);
         grp.async(io, Task.createFile, .{ &task1, io, dir, ".." });
         try testing.expect(evented.ready_queue != null);
@@ -921,4 +920,64 @@ test "group double cancel" {
     try Io.futexWait(io, u32, &val, 0);
     f.cancel(io) catch {};
     Io.futexWake(io, u32, &val2, 1);
+}
+
+test "reuse group" {
+    const Task = struct {
+        err: ?anyerror = null,
+        fn createFile(self: *@This(), io: Io, dir: Io.Dir, name: []const u8) Io.Cancelable!void {
+            const file = dir.createFile(io, name, .{}) catch |err| {
+                self.err = err;
+                switch (err) {
+                    error.Canceled => |e| return e,
+                    else => return,
+                }
+            };
+            file.close(io);
+        }
+    };
+
+    const gpa = testing.allocator;
+    var evented: Io.Evented = undefined;
+    try evented.init(gpa, .{ .thread_limit = 0 });
+    defer evented.deinit();
+    const io = evented.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = tmp.dir;
+
+    var grp: Io.Group = .init;
+    {
+        var task1: Task = .{};
+        var task2: Task = .{};
+        var task3: Task = .{};
+
+        grp.async(io, Task.createFile, .{ &task1, io, dir, ".." });
+        grp.async(io, Task.createFile, .{ &task2, io, dir, "file2" });
+        grp.async(io, Task.createFile, .{ &task3, io, dir, "file3" });
+        try grp.await(io);
+
+        try testing.expect(task1.err != null);
+        try testing.expectEqual(error.IsDir, task1.err.?);
+        try testing.expect(task2.err == null);
+        try testing.expect(task3.err == null);
+    }
+    grp = .init;
+    {
+        var task1: Task = .{};
+        var task2: Task = .{};
+        var task3: Task = .{};
+
+        grp.async(io, Task.createFile, .{ &task1, io, dir, ".." });
+        grp.async(io, Task.createFile, .{ &task2, io, dir, "file2" });
+        grp.async(io, Task.createFile, .{ &task3, io, dir, "file3" });
+
+        // if (true) return error.Exit; // this panics in uring.deinit();
+        grp.cancel(io);
+
+        try testing.expectEqual(error.Canceled, task1.err.?);
+        try testing.expectEqual(error.Canceled, task2.err.?);
+        try testing.expectEqual(error.Canceled, task3.err.?);
+    }
 }
