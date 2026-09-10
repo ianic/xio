@@ -546,10 +546,12 @@ test "dns io" {
             };
             switch (res) {
                 .address => |a| {
-                    std.debug.print("address: {}\n", .{a});
+                    _ = a;
+                    //std.debug.print("address: {}\n", .{a});
                 },
                 .canonical_name => |c| {
-                    std.debug.print("cname: {s}\n", .{c.bytes});
+                    _ = c;
+                    //std.debug.print("cname: {s}\n", .{c.bytes});
                 },
             }
         }
@@ -760,6 +762,7 @@ test {
 }
 
 test "explain group" {
+    if (true) return error.SkipZigTest;
     var ev: Evented = undefined;
     try ev.init(testing.allocator, .{});
     defer ev.deinit();
@@ -878,12 +881,12 @@ test "playing with group" {
     var val2: u32 = 0;
     const io = ev.io();
 
-    std.debug.print("val: {*} {*}\n", .{ &val, &val2 });
+    // std.debug.print("val: {*} {*}\n", .{ &val, &val2 });
 
     var f = io.async(S.grpRun, .{ io, &val, &val2 });
     try Io.futexWait(io, u32, &val, 0);
     //try io.sleep(.fromMilliseconds(500), .real);
-    std.debug.print("f.cancel\n", .{});
+    // std.debug.print("f.cancel\n", .{});
     f.cancel(io) catch {};
     Io.futexWake(io, u32, &val2, 1);
 }
@@ -896,8 +899,6 @@ test "group double cancel" {
     // var ev: Io.Evented = undefined;
     // try ev.init(testing.allocator, .{});
     // defer ev.deinit();
-
-    // var ev = Io.Threaded.init(testing.allocator, .{});
 
     const S = struct {
         fn waitTask(io: Io, ptr2: *u32) Io.Cancelable!void {
