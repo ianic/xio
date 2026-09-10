@@ -188,6 +188,44 @@ const Fiber = struct {
         return @ptrCast(try ev.backing_allocator.alignedAlloc(u8, .of(Fiber), allocation_size));
     }
 
+    fn init(fiber: *Fiber, ev: *Evented, context: []const u8, entry: AsyncClosure.Start) void {
+        const closure: *AsyncClosure = .fromFiber(fiber);
+        fiber.* = .{
+            .required_align = {},
+            .context = switch (builtin.cpu.arch) {
+                .aarch64 => .{
+                    .sp = @intFromPtr(closure),
+                    .fp = 0,
+                    .pc = @intFromPtr(&AsyncClosure.entry),
+                },
+                .riscv64 => .{
+                    .sp = @intFromPtr(closure),
+                    .fp = 0,
+                    .pc = @intFromPtr(&AsyncClosure.entry),
+                },
+                .x86_64 => .{
+                    .rsp = @intFromPtr(closure) - 8,
+                    .rbp = 0,
+                    .rip = @intFromPtr(&AsyncClosure.entry),
+                },
+                else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
+            },
+            .link = switch (entry) {
+                .future => .{ .awaiter = null },
+                .group => .{ .group = .{ .prev = null, .next = null } },
+            },
+            .status = .{ .queue_next = null },
+            .cancel_status = .unrequested,
+            .cancel_protection = .unblocked,
+        };
+        closure.* = .{
+            .evented = ev,
+            .fiber = fiber,
+            .start = entry,
+        };
+        @memcpy(closure.contextPointer(), context);
+    }
+
     fn destroy(fiber: *Fiber, ev: *Evented) void {
         assert(fiber.status.queue_next == null);
         fiber.status = .{ .free_next = ev.free_queue };
@@ -838,8 +876,18 @@ fn crashHandler(userdata: ?*anyopaque) void {
 const AsyncClosure = struct {
     evented: *Evented,
     fiber: *Fiber,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-    result_align: Alignment,
+    start: Start,
+
+    const Start = union(enum) {
+        future: struct {
+            start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+            result_align: Alignment,
+        },
+        group: struct {
+            group: Group,
+            start: *const fn (context: *const anyopaque) void,
+        },
+    };
 
     fn fromFiber(fiber: *Fiber) *AsyncClosure {
         return @ptrFromInt(Fiber.max_context_align.max(.of(AsyncClosure)).backward(
@@ -883,8 +931,17 @@ const AsyncClosure = struct {
         const ev = closure.evented;
         const fiber = closure.fiber;
         message.handle(ev);
-        closure.start(closure.contextPointer(), fiber.resultBytes(closure.result_align));
-        ev.yield(@atomicRmw(?*Fiber, &fiber.link.awaiter, .Xchg, Fiber.finished, .acq_rel), .nothing);
+        switch (closure.start) {
+            .future => |f| {
+                f.start(closure.contextPointer(), fiber.resultBytes(f.result_align));
+                ev.yield(@atomicRmw(?*Fiber, &fiber.link.awaiter, .Xchg, Fiber.finished, .acq_rel), .nothing);
+            },
+            .group => |g| {
+                assert(fiber.status.queue_next == null);
+                g.start(closure.contextPointer());
+                ev.yield(g.group.removeFiber(fiber), .destroy);
+            },
+        }
         unreachable; // switched to dead fiber
     }
 };
@@ -921,41 +978,10 @@ fn concurrent(
     const fiber = Fiber.create(ev) catch |err| switch (err) {
         error.OutOfMemory => return error.ConcurrencyUnavailable,
     };
-
-    const closure: *AsyncClosure = .fromFiber(fiber);
-    fiber.* = .{
-        .required_align = {},
-        .context = switch (builtin.cpu.arch) {
-            .aarch64 => .{
-                .sp = @intFromPtr(closure),
-                .fp = 0,
-                .pc = @intFromPtr(&AsyncClosure.entry),
-            },
-            .riscv64 => .{
-                .sp = @intFromPtr(closure),
-                .fp = 0,
-                .pc = @intFromPtr(&AsyncClosure.entry),
-            },
-            .x86_64 => .{
-                .rsp = @intFromPtr(closure) - 8,
-                .rbp = 0,
-                .rip = @intFromPtr(&AsyncClosure.entry),
-            },
-            else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-        },
-        .link = .{ .awaiter = null },
-        .status = .{ .queue_next = null },
-        .cancel_status = .unrequested,
-        .cancel_protection = .unblocked,
-    };
-    closure.* = .{
-        .evented = ev,
-        .fiber = fiber,
+    fiber.init(ev, context, .{ .future = .{
         .start = start,
         .result_align = result_alignment,
-    };
-    @memcpy(closure.contextPointer(), context);
-
+    } });
     ev.schedule(.{ .head = fiber, .tail = fiber });
     return @ptrCast(fiber);
 }
@@ -1073,63 +1099,6 @@ const Group = struct {
         group.ptr.state = @intFromPtr(awaiter);
         return awaiter.cancel_status.changeAwaiting(.nothing, .group);
     }
-
-    const AsyncClosure = struct {
-        evented: *Evented,
-        group: Group,
-        fiber: *Fiber,
-        start: *const fn (context: *const anyopaque) void,
-
-        fn fromFiber(fiber: *Fiber) *Group.AsyncClosure {
-            return @ptrFromInt(Fiber.max_context_align.max(.of(Group.AsyncClosure)).backward(
-                @intFromPtr(fiber.allocatedEnd()) - Fiber.max_context_size,
-            ) - @sizeOf(Group.AsyncClosure));
-        }
-
-        fn contextPointer(
-            closure: *Group.AsyncClosure,
-        ) [*]align(Fiber.max_context_align.toByteUnits()) u8 {
-            return @alignCast(@as([*]u8, @ptrCast(closure)) + @sizeOf(Group.AsyncClosure));
-        }
-
-        fn entry() callconv(.naked) void {
-            switch (builtin.cpu.arch) {
-                .aarch64 => asm volatile (
-                    \\ mov x0, sp
-                    \\ b %[call]
-                    :
-                    : [call] "X" (&call),
-                ),
-                .riscv64 => asm volatile (
-                    \\ mv a0, sp
-                    \\ tail %[call]@plt
-                    :
-                    : [call] "X" (&call),
-                ),
-                .x86_64 => asm volatile (
-                    \\ leaq 8(%%rsp), %%rdi
-                    \\ jmp %[call:P]
-                    :
-                    : [call] "X" (&call),
-                ),
-                else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-            }
-        }
-
-        fn call(
-            closure: *Group.AsyncClosure,
-            contexts: *const Io.fiber.Switch,
-        ) callconv(.withStackAlign(.c, @alignOf(Group.AsyncClosure))) noreturn {
-            const message: *const SwitchMessage = @fieldParentPtr("contexts", contexts);
-            const ev = closure.evented;
-            const fiber = closure.fiber;
-            message.handle(ev);
-            assert(fiber.status.queue_next == null);
-            closure.start(closure.contextPointer());
-            ev.yield(closure.group.removeFiber(fiber), .destroy);
-            unreachable; // switched to dead fiber
-        }
-    };
 };
 
 fn groupAsync(
@@ -1160,40 +1129,10 @@ fn groupConcurrent(
     const fiber = Fiber.create(ev) catch |err| switch (err) {
         error.OutOfMemory => return error.ConcurrencyUnavailable,
     };
-
-    const closure: *Group.AsyncClosure = .fromFiber(fiber);
-    fiber.* = .{
-        .required_align = {},
-        .context = switch (builtin.cpu.arch) {
-            .aarch64 => .{
-                .sp = @intFromPtr(closure),
-                .fp = 0,
-                .pc = @intFromPtr(&Group.AsyncClosure.entry),
-            },
-            .riscv64 => .{
-                .sp = @intFromPtr(closure),
-                .fp = 0,
-                .pc = @intFromPtr(&Group.AsyncClosure.entry),
-            },
-            .x86_64 => .{
-                .rsp = @intFromPtr(closure) - 8,
-                .rbp = 0,
-                .rip = @intFromPtr(&Group.AsyncClosure.entry),
-            },
-            else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-        },
-        .link = .{ .group = .{ .prev = null, .next = null } },
-        .status = .{ .queue_next = null },
-        .cancel_status = .unrequested,
-        .cancel_protection = .unblocked,
-    };
-    closure.* = .{
-        .evented = ev,
+    fiber.init(ev, context, .{ .group = .{
         .group = group,
-        .fiber = fiber,
         .start = start,
-    };
-    @memcpy(closure.contextPointer(), context);
+    } });
     group.addFiber(fiber);
     ev.schedule(.{ .head = fiber, .tail = fiber });
 }
