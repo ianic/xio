@@ -1017,25 +1017,29 @@ const Group = struct {
 
     // Parent Io.Group token holds list of fibers for the group. When null there
     // is no active fibers.
-    fn fibersHead(group: Group) ?*Fiber {
+    fn listGet(group: Group) ?*Fiber {
         return @ptrCast(@alignCast(group.ptr.token.load(.unordered)));
     }
-    fn fibersSetHead(group: Group, fiber: ?*Fiber) void {
+    fn listSet(group: Group, fiber: ?*Fiber) void {
         group.ptr.token.store(fiber, .unordered);
     }
-    // Parent Io.Group state holds pointer to the awaiting fiber. It is set when
-    // gropu await or cancel is called.
-    fn awaiterPtr(group: Group) ?*Fiber {
+    // Parent Io.Group state holds pointer to the awaiting fiber. It is set in
+    // await or cancel.
+    fn awaiterGet(group: Group) ?*Fiber {
         return @ptrFromInt(group.ptr.state);
+    }
+    fn awaiterSet(group: Group, awaiter: ?*Fiber) void {
+        assert(awaiter == null or group.awaiterGet() == null);
+        group.ptr.state = @intFromPtr(awaiter);
     }
 
     fn addFiber(group: Group, fiber: *Fiber) void {
-        if (group.fibersHead()) |head| {
+        if (group.listGet()) |head| {
             fiber.cancel_status = .{ .requested = (head.cancel_status.requested), .awaiting = .nothing };
             head.link.group.prev = fiber;
             fiber.link.group.next = head;
         }
-        group.fibersSetHead(fiber);
+        group.listSet(fiber);
     }
 
     fn removeFiber(group: Group, fiber: *Fiber) ?*Fiber {
@@ -1045,25 +1049,25 @@ const Group = struct {
             prev.link.group.next = fiber.link.group.next;
         } else if (fiber.link.group.next) |new_head| {
             // removed was list head, and there is next
-            group.fibersSetHead(new_head);
-        } else if (group.awaiterPtr()) |awaiter| {
+            group.listSet(new_head);
+        } else if (group.awaiterGet()) |awaiter| {
             // removed was last fiber in the list and there is awaiter
             assert(awaiter.status.awaiting_group.ptr == group.ptr);
-            group.fibersSetHead(null);
-            group.ptr.state = 0; // remove group awaiter
+            group.listSet(null);
+            group.awaiterSet(null);
             awaiter.status = .{ .queue_next = null };
             _ = awaiter.cancel_status.changeAwaiting(.group, .nothing);
             return awaiter;
         } else {
             // removed was last fiber and there is no awaiter
-            group.fibersSetHead(null);
+            group.listSet(null);
         }
         return null;
     }
 
     // Returns true if there is nothing to wait for
     fn await(group: Group, ev: *Evented, awaiter: *Fiber) bool {
-        if (group.fibersHead()) |_| {
+        if (group.listGet()) |_| {
             if (group.registerAwaiter(awaiter) and awaiter.cancel_protection.check() == .unblocked) {
                 // The awaiter already had an unacknowledged cancelation request before
                 // attempting to await a group, so propagate the cancelation to the group.
@@ -1075,7 +1079,7 @@ const Group = struct {
     }
 
     fn cancel(group: Group, ev: *Evented, maybe_awaiter: ?*Fiber) bool {
-        if (group.fibersHead()) |head| {
+        if (group.listGet()) |head| {
             // fibers list is not empty, cancel all fibers
             var maybe_fiber: ?*Fiber = head;
             while (maybe_fiber) |fiber| {
@@ -1087,16 +1091,13 @@ const Group = struct {
             if (maybe_awaiter) |awaiter| _ = group.registerAwaiter(awaiter);
             return false;
         }
-        // group has no fibers, re-init
-        group.fibersSetHead(null);
         return true;
     }
 
     fn registerAwaiter(group: Group, awaiter: *Fiber) bool {
         assert(awaiter.status.queue_next == null);
         awaiter.status = .{ .awaiting_group = group };
-        assert(group.awaiterPtr() == null);
-        group.ptr.state = @intFromPtr(awaiter);
+        group.awaiterSet(awaiter);
         return awaiter.cancel_status.changeAwaiting(.nothing, .group);
     }
 };
@@ -1267,10 +1268,7 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     return switch (operation) {
         .file_read_streaming => |o| .{
-            .file_read_streaming = ev.fileReadStreaming(
-                o.file,
-                o.data,
-            ) catch |err| switch (err) {
+            .file_read_streaming = ev.fileReadStreaming(o.file, o.data) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 else => |e| e,
             },
@@ -3874,6 +3872,17 @@ fn netSocketCreatePairUnavailable(
     _ = userdata;
     _ = options;
     return error.OperationUnsupported;
+}
+
+fn netSendOperation(ev: Evented, o: Io.Operation.NetSend) Io.Cancelable!struct { ?net.Socket.SendError, usize } {
+    const opt_err, const n = ev.netSend(o.socket_handle, o.messages, o.flags);
+    return .{
+        if (opt_err) |err| switch (err) {
+            error.Canceled => |e| return e,
+            else => |e| e,
+        } else null,
+        n,
+    };
 }
 
 fn netSend(

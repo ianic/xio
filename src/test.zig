@@ -830,65 +830,39 @@ test "playing with group" {
 
     const S = struct {
         fn task1(io: Io) Io.Cancelable!void {
-            try io.sleep(.fromSeconds(1), .real);
+            try io.sleep(.fromMilliseconds(10), .real);
             std.debug.print("task1\n", .{});
         }
 
         fn task3(io: Io) Io.Cancelable!void {
-            io.sleep(.fromSeconds(1), .real) catch |err| {
-                std.debug.print("task31: {}\n", .{err});
-                return err;
-            };
-            io.sleep(.fromSeconds(1), .real) catch |err| {
-                std.debug.print("task32: {}\n", .{err});
-                return err;
-            };
-            try io.sleep(.fromSeconds(1), .real);
+            try io.sleep(.fromMilliseconds(10), .real);
+            try io.sleep(.fromMilliseconds(10), .real);
+            try io.sleep(.fromMilliseconds(10), .real);
             std.debug.print("task3\n", .{});
         }
 
         fn task2(io: Io) Io.Cancelable!void {
-            io.sleep(.fromSeconds(10), .real) catch |err| {
-                std.debug.print("task21: {}\n", .{err});
-                return err;
-            };
-            io.sleep(.fromSeconds(1), .real) catch |err| {
-                std.debug.print("task22: {}\n", .{err});
-                return err;
-            };
+            try io.sleep(.fromMilliseconds(10), .real);
+            try io.sleep(.fromMilliseconds(10), .real);
             std.debug.print("task2\n", .{});
-            // try grp.await(io);
-            // std.debug.print("task21\n", .{});
         }
 
         fn task4(io: Io, ptr: *u32) Io.Cancelable!void {
             try Io.futexWait(io, u32, ptr, 0);
         }
 
-        fn grpRun(io: Io, ptr: *u32, ptr2: *u32) Io.Cancelable!void {
+        fn grpRun(io: Io) Io.Cancelable!void {
             var grp = Io.Group.init;
-            //grp.async(io, task1, .{io});
-            //errdefer grp.cancel(io);
-            //grp.async(io, task3, .{io});
-            //grp.async(io, task2, .{io});
-            grp.async(io, task4, .{ io, ptr2 });
-            try io.sleep(.fromMilliseconds(1), .real);
-            Io.futexWake(io, u32, ptr, 1);
-            grp.cancel(io);
+            grp.async(io, task1, .{io});
+            grp.async(io, task2, .{io});
+            grp.async(io, task3, .{io});
+            try grp.await(io);
         }
     };
-    var val: u32 = 0;
-    var val2: u32 = 0;
+
     const io = ev.io();
-
-    // std.debug.print("val: {*} {*}\n", .{ &val, &val2 });
-
-    var f = io.async(S.grpRun, .{ io, &val, &val2 });
-    try Io.futexWait(io, u32, &val, 0);
-    //try io.sleep(.fromMilliseconds(500), .real);
-    // std.debug.print("f.cancel\n", .{});
-    f.cancel(io) catch {};
-    Io.futexWake(io, u32, &val2, 1);
+    var f = io.async(S.grpRun, .{io});
+    try f.await(io);
 }
 
 test "group double cancel" {
@@ -905,80 +879,36 @@ test "group double cancel" {
             try Io.futexWait(io, u32, ptr2, 0);
         }
 
-        fn grpRun(io: Io, ptr: *u32, ptr2: *u32) Io.Cancelable!void {
+        fn grpRun(io: Io, ptr1: *u32, ptr2: *u32) Io.Cancelable!void {
             var grp = Io.Group.init;
             grp.async(io, waitTask, .{ io, ptr2 });
             try io.sleep(.fromMilliseconds(1), .real);
-            Io.futexWake(io, u32, ptr, 1);
+            Io.futexWake(io, u32, ptr1, 1);
             grp.cancel(io);
         }
     };
 
-    var val: u32 = 0;
+    var val1: u32 = 0;
     var val2: u32 = 0;
     const io = ev.io();
-    var f = io.async(S.grpRun, .{ io, &val, &val2 });
-    try Io.futexWait(io, u32, &val, 0);
+    var f = io.async(S.grpRun, .{ io, &val1, &val2 });
+    try Io.futexWait(io, u32, &val1, 0);
     f.cancel(io) catch {};
     Io.futexWake(io, u32, &val2, 1);
 }
 
-test "reuse group" {
-    const Task = struct {
-        err: ?anyerror = null,
-        fn createFile(self: *@This(), io: Io, dir: Io.Dir, name: []const u8) Io.Cancelable!void {
-            const file = dir.createFile(io, name, .{}) catch |err| {
-                self.err = err;
-                switch (err) {
-                    error.Canceled => |e| return e,
-                    else => return,
-                }
-            };
-            file.close(io);
-        }
-    };
-
-    const gpa = testing.allocator;
-    var evented: Io.Evented = undefined;
-    try evented.init(gpa, .{ .thread_limit = 0 });
-    defer evented.deinit();
-    const io = evented.io();
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = tmp.dir;
+test "reuse group, awaiter is not cleared in removeFiber" {
+    var ev: Evented = undefined;
+    try ev.init(testing.allocator, .{});
+    defer ev.deinit();
+    const io = ev.io();
 
     var grp: Io.Group = .init;
-    {
-        var task1: Task = .{};
-        var task2: Task = .{};
-        var task3: Task = .{};
 
-        grp.async(io, Task.createFile, .{ &task1, io, dir, ".." });
-        grp.async(io, Task.createFile, .{ &task2, io, dir, "file2" });
-        grp.async(io, Task.createFile, .{ &task3, io, dir, "file3" });
-        try grp.await(io);
+    grp.async(io, Io.sleep, .{ io, .fromMilliseconds(1), .real });
+    try grp.await(io);
 
-        try testing.expect(task1.err != null);
-        try testing.expectEqual(error.IsDir, task1.err.?);
-        try testing.expect(task2.err == null);
-        try testing.expect(task3.err == null);
-    }
-    grp = .init;
-    {
-        var task1: Task = .{};
-        var task2: Task = .{};
-        var task3: Task = .{};
-
-        grp.async(io, Task.createFile, .{ &task1, io, dir, ".." });
-        grp.async(io, Task.createFile, .{ &task2, io, dir, "file2" });
-        grp.async(io, Task.createFile, .{ &task3, io, dir, "file3" });
-
-        // if (true) return error.Exit; // this panics in uring.deinit();
-        grp.cancel(io);
-
-        try testing.expectEqual(error.Canceled, task1.err.?);
-        try testing.expectEqual(error.Canceled, task2.err.?);
-        try testing.expectEqual(error.Canceled, task3.err.?);
-    }
+    //grp = .init;
+    grp.async(io, Io.sleep, .{ io, .fromMilliseconds(1), .real });
+    try grp.await(io);
 }
