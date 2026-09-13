@@ -215,6 +215,7 @@ const Fiber = struct {
             .link = switch (entry) {
                 .future => .{ .awaiter = null },
                 .group => .{ .group = .{ .prev = null, .next = null } },
+                .operation => .{ .awaiter = null },
             },
             .status = .{ .queue_next = null },
             .cancel_status = .unrequested,
@@ -889,6 +890,9 @@ const AsyncClosure = struct {
             group: Group,
             start: *const fn (context: *const anyopaque) void,
         },
+        operation: struct {
+            pending: *Io.Operation.Storage.Pending,
+        },
     };
 
     fn fromFiber(fiber: *Fiber) *AsyncClosure {
@@ -942,6 +946,54 @@ const AsyncClosure = struct {
                 assert(fiber.status.queue_next == null);
                 g.start(closure.contextPointer());
                 ev.yield(g.group.removeFiber(fiber), .destroy);
+            },
+            .operation => |o| {
+                // start operation
+                const operation: *Io.Operation = @ptrCast(closure.contextPointer());
+                const maybe_result = operate(ev, operation.*);
+
+                const pending: *Io.Operation.Storage.Pending = o.pending;
+                const storage: *Io.Operation.Storage = @fieldParentPtr("pending", pending);
+                const batch: *Io.Batch = @ptrFromInt(pending.userdata[0]);
+                const index: Io.Operation.OptionalIndex = .fromIndex(pending.userdata[1]);
+
+                // remove from pending
+                switch (pending.node.prev) {
+                    .none => batch.pending.head = pending.node.next,
+                    else => |prev_index| batch.storage[prev_index.toIndex()].pending.node.next =
+                        pending.node.next,
+                }
+                switch (pending.node.next) {
+                    .none => batch.pending.tail = pending.node.prev,
+                    else => |prev_index| batch.storage[prev_index.toIndex()].pending.node.prev =
+                        pending.node.prev,
+                }
+                if (maybe_result) |result| {
+                    // add to completed
+                    switch (batch.completed.tail) {
+                        .none => batch.completed.head = index,
+                        else => |tail_index| batch.storage[tail_index.toIndex()].completion.node.next =
+                            index,
+                    }
+                    storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
+                    batch.completed.tail = index;
+                } else |err| {
+                    // if canceled add to unused
+                    assert(err == error.Canceled);
+                    switch (batch.unused.tail) {
+                        .none => batch.unused.head = index,
+                        else => |tail_index| batch.storage[tail_index.toIndex()].unused.next = index,
+                    }
+                    storage.* = .{ .unused = .{ .prev = batch.unused.tail, .next = .none } };
+                    batch.unused.tail = index;
+                }
+                // schedule batch fiber
+                if (@atomicRmw(?*anyopaque, &batch.userdata, .Xchg, null, .acq_rel)) |ptr| {
+                    const batch_fiber: *Fiber = @ptrCast(@alignCast(ptr));
+                    ev.schedule(.{ .head = batch_fiber, .tail = batch_fiber });
+                }
+                fiber.destroy(ev);
+                ev.yield(null, .nothing);
             },
         }
         unreachable; // switched to dead fiber
@@ -1421,6 +1473,14 @@ fn batchAwaitConcurrent(
         return;
     }
 
+    if (true) { // TODO timeout
+        try ev.batchDrainSubmitted2(batch);
+        if (batch.completed.head != .none or batch.pending.head == .none) return;
+        batch.userdata = ev.currentFiber();
+        ev.yield(null, .nothing);
+        return;
+    }
+
     try ev.batchDrainSubmitted(batch, true);
 
     const timespec: linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = while (true) {
@@ -1490,6 +1550,52 @@ fn batchAwaitConcurrent(
         };
         ev.yield(null, .{ .batch_await = batch });
     }
+}
+
+fn batchDrainSubmitted2(ev: *Evented, batch: *Io.Batch) (Io.ConcurrentError || Io.Cancelable)!void {
+    var index = batch.submitted.head;
+    if (index == .none) return;
+    errdefer batch.submitted.head = index;
+
+    var maybe_ready_queue: ?Fiber.Queue = null;
+    while (index != .none) {
+        const storage = &batch.storage[index.toIndex()];
+        const next_index = storage.submission.node.next;
+        const operation = storage.submission.operation;
+        const fiber = Fiber.create(ev) catch |err| switch (err) {
+            error.OutOfMemory => return error.ConcurrencyUnavailable,
+        };
+
+        // switch storage to pending
+        storage.* = .{ .pending = .{
+            .node = .{ .prev = batch.pending.tail, .next = .none },
+            .tag = operation,
+            .userdata = .{ @intFromPtr(batch), @intCast(index.toIndex()), 0, 0, 0, 0, 0 },
+        } };
+        // init fiber
+        fiber.init(ev, std.mem.asBytes(&operation), .{
+            .operation = .{
+                .pending = &storage.pending,
+            },
+        });
+
+        // move batch operation to pending
+        switch (batch.pending.tail) {
+            .none => batch.pending.head = index,
+            else => |tail_index| batch.storage[tail_index.toIndex()].pending.node.next = index,
+        }
+        batch.pending.tail = index;
+
+        // add fiber to the queue
+        if (maybe_ready_queue) |*ready_queue| {
+            ready_queue.tail.status.queue_next = fiber;
+            ready_queue.tail = fiber;
+        } else maybe_ready_queue = .{ .head = fiber, .tail = fiber };
+
+        index = next_index;
+    }
+    batch.submitted = .{ .head = .none, .tail = .none };
+    if (maybe_ready_queue) |ready_queue| ev.schedule(ready_queue);
 }
 
 /// If `concurrency` is false, `error.ConcurrencyUnavailable` is unreachable.

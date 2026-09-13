@@ -707,7 +707,7 @@ test "netReceive" {
 }
 
 test "explain batch" {
-    if (true) return error.SkipZigTest;
+    // if (true) return error.SkipZigTest;
     const gpa = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -741,12 +741,14 @@ test "explain batch" {
         .data = &[_][]const u8{"nije reko dobar dan"},
     } });
 
-    while (!(batch.pending.head == .none and batch.submitted.head == .none)) {
+    var completed: usize = 0;
+    while (completed < 3) {
         try batch.awaitConcurrent(
             io,
             .{ .duration = .{ .clock = .real, .raw = .fromMicroseconds(100) } },
         );
         while (batch.next()) |completion| {
+            completed += 1;
             std.debug.print("completion.index: {}\n", .{completion.index});
             switch (completion.index) {
                 0 => try testing.expectEqual(16, (try completion.result.file_write_streaming)),
@@ -754,6 +756,7 @@ test "explain batch" {
                 else => unreachable,
             }
         }
+        try io.sleep(.fromMilliseconds(1), .real);
     }
 }
 
