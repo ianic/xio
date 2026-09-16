@@ -706,7 +706,7 @@ test "netReceive" {
     try testing.expectEqual(error.Timeout, recv_err.?);
 }
 
-test "explain batch" {
+test "explain batch123" {
     // if (true) return error.SkipZigTest;
     const gpa = testing.allocator;
 
@@ -742,22 +742,30 @@ test "explain batch" {
     } });
 
     var completed: usize = 0;
-    while (completed < 3) {
-        try batch.awaitConcurrent(
+    var timeouts: usize = 0;
+    while (completed < 4) {
+        batch.awaitConcurrent(
             io,
-            .{ .duration = .{ .clock = .real, .raw = .fromMicroseconds(100) } },
-        );
+            .{ .duration = .{ .clock = .real, .raw = .fromMicroseconds(10) } },
+        ) catch |err| switch (err) {
+            error.Timeout => {
+                timeouts += 1;
+            },
+            else => |e| return e,
+        };
         while (batch.next()) |completion| {
             completed += 1;
-            std.debug.print("completion.index: {}\n", .{completion.index});
+            std.debug.print("completed {} {}\n", .{ completion.index, completed });
             switch (completion.index) {
                 0 => try testing.expectEqual(16, (try completion.result.file_write_streaming)),
                 1, 2, 3 => try testing.expectEqual(19, (try completion.result.file_write_streaming)),
                 else => unreachable,
             }
         }
-        try io.sleep(.fromMilliseconds(1), .real);
+        if (timeouts > 256) return error.Overflow;
+        //try io.sleep(.fromMilliseconds(1), .real);
     }
+    std.debug.print("test timeouts: {}, completed: {}\n", .{ timeouts, completed });
 }
 
 test {
