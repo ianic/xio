@@ -215,8 +215,7 @@ const Fiber = struct {
             .link = switch (entry) {
                 .future => .{ .awaiter = null },
                 .group => .{ .group = .{ .prev = null, .next = null } },
-                .operation => .{ .awaiter = null },
-                //               .timeout => .{ .awaiter = null },
+                .batch_operation => .{ .awaiter = null },
             },
             .status = .{ .queue_next = null },
             .cancel_status = .unrequested,
@@ -253,8 +252,11 @@ const Fiber = struct {
         return @ptrFromInt(alignment.forward(@intFromPtr(f) + @sizeOf(Fiber)));
     }
 
-    fn complete(f: *Fiber, c: Completion) void {
-        f.resultPointer(Completion).* = c;
+    fn complete(f: *Fiber, cqe: IoUring.Cqe) void {
+        f.resultPointer(Completion).* = .{
+            .result = cqe.res,
+            .flags = cqe.flags,
+        };
         _ = f.cancel_status.changeAwaiting(.operation, .nothing);
     }
     fn completion(f: *Fiber) Completion {
@@ -748,25 +750,14 @@ fn idle(ev: *Evented) void {
                     _ => if (@as(?*Fiber, ready_fiber: switch (@as(u2, @truncate(cqe.user_data))) {
                         // fiber
                         0b00 => {
-                            const ready_fiber: *Fiber = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                            ready_fiber.complete(.{
-                                .result = cqe.res,
-                                .flags = cqe.flags,
-                            });
-                            break :ready_fiber ready_fiber;
+                            const fiber: *Fiber = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
+                            fiber.complete(cqe);
+                            break :ready_fiber fiber;
                         },
                         // batch timeout
                         0b01 => {
                             const batch: *Io.Batch = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                            const val = @intFromPtr(batch.userdata.?);
-                            const batch_fiber: *Fiber = @ptrFromInt(val & ~@as(usize, 0b11));
-                            const flags = (val & 0b11);
-                            batch.userdata = @ptrFromInt((val & ~@as(usize, 0b11) | 0b10));
-                            batch_fiber.complete(.{
-                                .result = cqe.res,
-                                .flags = cqe.flags,
-                            });
-                            break :ready_fiber if (flags <= 1) batch_fiber else null;
+                            break :ready_fiber batchTimeoutComplete(batch, cqe);
                         },
                         // batch operation
                         0b10 => {
@@ -905,7 +896,7 @@ const AsyncClosure = struct {
             group: Group,
             start: *const fn (context: *const anyopaque) void,
         },
-        operation: struct {
+        batch_operation: struct {
             pending: *Io.Operation.Storage.Pending,
         },
     };
@@ -962,54 +953,9 @@ const AsyncClosure = struct {
                 g.start(closure.contextPointer());
                 ev.yield(g.group.removeFiber(fiber), .destroy);
             },
-            .operation => |o| {
-                // start operation
+            .batch_operation => |b| {
                 const operation: *Io.Operation = @ptrCast(closure.contextPointer());
-                const maybe_result = operate(ev, operation.*);
-
-                const pending: *Io.Operation.Storage.Pending = o.pending;
-                const storage: *Io.Operation.Storage = @fieldParentPtr("pending", pending);
-                const batch: *Io.Batch = @ptrFromInt(pending.userdata[0]);
-                const index: Io.Operation.OptionalIndex = .fromIndex(pending.userdata[1]);
-
-                // remove from pending
-                switch (pending.node.prev) {
-                    .none => batch.pending.head = pending.node.next,
-                    else => |prev_index| batch.storage[prev_index.toIndex()].pending.node.next =
-                        pending.node.next,
-                }
-                switch (pending.node.next) {
-                    .none => batch.pending.tail = pending.node.prev,
-                    else => |prev_index| batch.storage[prev_index.toIndex()].pending.node.prev =
-                        pending.node.prev,
-                }
-                if (maybe_result) |result| {
-                    // add to completed
-                    switch (batch.completed.tail) {
-                        .none => batch.completed.head = index,
-                        else => |tail_index| batch.storage[tail_index.toIndex()].completion.node.next =
-                            index,
-                    }
-                    storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
-                    batch.completed.tail = index;
-                } else |err| {
-                    // if canceled add to unused
-                    assert(err == error.Canceled);
-                    switch (batch.unused.tail) {
-                        .none => batch.unused.head = index,
-                        else => |tail_index| batch.storage[tail_index.toIndex()].unused.next = index,
-                    }
-                    storage.* = .{ .unused = .{ .prev = batch.unused.tail, .next = .none } };
-                    batch.unused.tail = index;
-                }
-
-                const val = @intFromPtr(batch.userdata.?);
-                const flags = (val & 0b11);
-                if (flags == 0) {
-                    const batch_fiber: *Fiber = @ptrFromInt(val & ~@as(usize, 0b11));
-                    batch.userdata = @ptrFromInt(val | 0b11);
-                    ev.schedule(.{ .head = batch_fiber, .tail = batch_fiber });
-                }
+                ev.batchOperationComplete(b.pending, operate(ev, operation.*));
                 ev.yield(null, .destroy);
             },
         }
@@ -1432,20 +1378,40 @@ fn deviceIoControl(ev: *Evented, o: Io.Operation.DeviceIoControl) Io.Cancelable!
 }
 
 fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
-    // TODO: switch to awaitconcurrent
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    ev.batchDrainSubmitted(batch, false) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => unreachable, // passed concurrency=false
-        error.Canceled => |e| return e,
-    };
-    while (true) {
-        batchDrainReady(batch) catch |err| switch (err) {
-            error.Timeout => unreachable, // no timeout
-        };
-        if (batch.completed.head != .none or batch.pending.head == .none) return;
-        ev.yield(null, .{ .batch_await = batch });
-    }
+    _ = userdata;
+    _ = batch;
+    @panic("TODO implement");
 }
+
+const BatchUserdata = struct {
+    fiber: *Fiber,
+    flags: Flags = .any,
+
+    const Flags = enum(u2) {
+        // wakeup allowed by
+        any = 0b00,
+        timeout = 0b01,
+        // woken by
+        by_timeout = 0b10,
+        by_operation = 0b11,
+    };
+    // wakeup allowed by 0 - any,  11 - none, 01 - timeout, 10 - wakeup was by timeout
+
+    fn unpack(batch: *Io.Batch) BatchUserdata {
+        const val = @intFromPtr(batch.userdata.?);
+        const fiber: *Fiber = @ptrFromInt(val & ~@as(usize, 0b11));
+        const flags: u2 = @truncate(val & 0b11);
+
+        return .{
+            .fiber = fiber,
+            .flags = @fromBackingInt(flags),
+        };
+    }
+
+    fn pack(ud: BatchUserdata, batch: *Io.Batch, wakeup: Flags) void {
+        batch.userdata = @ptrFromInt(@intFromPtr(ud.fiber) | @backingInt(wakeup));
+    }
+};
 
 fn batchAwaitConcurrent(
     userdata: ?*anyopaque,
@@ -1504,19 +1470,21 @@ fn batchAwaitConcurrent(
             sqe.timeout(timeout_userdata, timespec, 0, timeout_flags);
         }
 
-        // wait for completions (or timeout)
-        batch.userdata = fiber;
+        var ud: BatchUserdata = .{ .fiber = fiber };
+        ud.pack(batch, .any);
         ev.yield(null, .nothing);
-        const val = @intFromPtr(batch.userdata.?);
-        const flags = (val & 0b11); // wakeup allowed by 0 - any,  11 - none, 01 - timeout, 10 - wakeup was by timeout
-        const timeouted = flags == 0b10;
+        ud = .unpack(batch);
+        assert(ud.flags == .by_timeout or ud.flags == .by_operation);
 
         if (maybe_timespec) |_| {
-            if (!timeouted) {
+            if (ud.flags != .by_timeout) {
+                // remove timeout
                 const sqe = ev.getSqe();
                 sqe.timeoutRemove(@backingInt(Completion.Userdata.wakeup), timeout_userdata);
-                batch.userdata = @ptrFromInt(@intFromPtr(fiber) | 0b01);
+                ud.pack(batch, .timeout);
                 ev.yield(null, .nothing);
+                ud = .unpack(batch);
+                assert(ud.flags == .by_timeout);
                 switch (fiber.errno()) {
                     .SUCCESS, .TIME => {},
                     .INTR => {},
@@ -1631,7 +1599,7 @@ fn batchDrainSubmitted2(ev: *Evented, batch: *Io.Batch) (Io.ConcurrentError || I
 
         // init fiber
         fiber.init(ev, std.mem.asBytes(&operation), .{
-            .operation = .{
+            .batch_operation = .{
                 .pending = &storage.pending,
             },
         });
@@ -1647,6 +1615,60 @@ fn batchDrainSubmitted2(ev: *Evented, batch: *Io.Batch) (Io.ConcurrentError || I
 
     batch.submitted = .{ .head = .none, .tail = .none };
     if (maybe_ready_queue) |ready_queue| ev.schedule(ready_queue);
+}
+
+fn batchOperationComplete(
+    ev: *Evented,
+    pending: *Io.Operation.Storage.Pending,
+    operate_result: Io.Cancelable!Io.Operation.Result,
+) void {
+    const storage: *Io.Operation.Storage = @fieldParentPtr("pending", pending);
+    const batch: *Io.Batch = @ptrFromInt(pending.userdata[0]);
+    const index: Io.Operation.OptionalIndex = .fromIndex(pending.userdata[1]);
+
+    // remove from pending
+    switch (pending.node.prev) {
+        .none => batch.pending.head = pending.node.next,
+        else => |prev_index| batch.storage[prev_index.toIndex()].pending.node.next =
+            pending.node.next,
+    }
+    switch (pending.node.next) {
+        .none => batch.pending.tail = pending.node.prev,
+        else => |prev_index| batch.storage[prev_index.toIndex()].pending.node.prev =
+            pending.node.prev,
+    }
+    if (operate_result) |result| {
+        // add to completed
+        switch (batch.completed.tail) {
+            .none => batch.completed.head = index,
+            else => |tail_index| batch.storage[tail_index.toIndex()].completion.node.next =
+                index,
+        }
+        storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
+        batch.completed.tail = index;
+    } else |err| {
+        // if canceled add to unused
+        assert(err == error.Canceled);
+        switch (batch.unused.tail) {
+            .none => batch.unused.head = index,
+            else => |tail_index| batch.storage[tail_index.toIndex()].unused.next = index,
+        }
+        storage.* = .{ .unused = .{ .prev = batch.unused.tail, .next = .none } };
+        batch.unused.tail = index;
+    }
+
+    var ud: BatchUserdata = .unpack(batch);
+    if (ud.flags == .any) {
+        ud.pack(batch, .by_operation);
+        ev.schedule(.{ .head = ud.fiber, .tail = ud.fiber });
+    }
+}
+
+fn batchTimeoutComplete(batch: *Io.Batch, cqe: IoUring.Cqe) ?*Fiber {
+    const ud: BatchUserdata = .unpack(batch);
+    ud.fiber.complete(cqe);
+    ud.pack(batch, .by_timeout);
+    return if (ud.flags == .any or ud.flags == .timeout) ud.fiber else null;
 }
 
 /// If `concurrency` is false, `error.ConcurrencyUnavailable` is unreachable.
