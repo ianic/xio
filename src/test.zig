@@ -706,13 +706,22 @@ test "netReceive" {
     try testing.expectEqual(error.Timeout, recv_err.?);
 }
 
-test "explain batch123" {
+test "explain batch" {
     // if (true) return error.SkipZigTest;
     const gpa = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = tmp.dir;
+
+    // var threaded = Io.Threaded.init(gpa, .{});
+    // defer threaded.deinit();
+    // const io = threaded.io();
+
+    // var ev: Io.Uring = undefined;
+    // try ev.init(gpa, .{});
+    // defer ev.deinit();
+    // const io = ev.io();
 
     var ev: Evented = undefined;
     try ev.init(gpa, .{});
@@ -746,7 +755,7 @@ test "explain batch123" {
     while (completed < 4) {
         batch.awaitConcurrent(
             io,
-            .{ .duration = .{ .clock = .real, .raw = .fromMicroseconds(10) } },
+            .{ .duration = .{ .clock = .real, .raw = .fromMicroseconds(1) } },
         ) catch |err| switch (err) {
             error.Timeout => {
                 timeouts += 1;

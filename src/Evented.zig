@@ -642,15 +642,31 @@ const Completion = struct {
     result: i32,
     flags: IoUring.Cqe.Flags,
 
-    const Userdata = enum(usize) {
+    const Userdata = enum(u64) {
         unused,
         wakeup,
         futex_wake,
         close,
-        cleanup,
-        /// If bit 0 is 1, a pointer to the `context` field of `Io.Batch.Storage.Pending`.
-        /// If bits 0 and 1 are 0, a `*Fiber`.
+
+        /// Lower 2 bits can be used as flag
         _,
+
+        fn pack(ptr: *anyopaque, flag: Flags) u64 {
+            return @intFromPtr(ptr) | @backingInt(flag);
+        }
+
+        fn flags(self: Userdata) Flags {
+            return @fromBackingInt(@intCast(@as(u2, @truncate(@backingInt(self)))));
+        }
+
+        fn pointer(self: Userdata, comptime T: type) T {
+            return @ptrFromInt(@backingInt(self) & ~@as(usize, 0b11));
+        }
+
+        const Flags = enum(u2) {
+            fiber = 0b00,
+            batch_timeout = 0b01,
+        };
     };
 
     fn errno(completion: Completion) linux.E {
@@ -697,13 +713,14 @@ fn mainIdle(
 }
 
 fn idle(ev: *Evented) void {
-    var maybe_ready_fiber: ?*Fiber = null;
     while (true) {
-        while (maybe_ready_fiber orelse ev.findReadyFiber()) |ready_fiber| {
+        // drain ready queue, wakeup all ready fibers
+        while (ev.findReadyFiber()) |ready_fiber| {
             ev.yield(ready_fiber, .nothing);
-            maybe_ready_fiber = null;
         }
         assert(ev.ready_queue == null);
+
+        // enter kernel, wait for completions
         _ = ev.io_uring.submit(.{ .nr = 1 }) catch |err| switch (err) {
             error.SignalInterrupt => {},
             error.TimeoutExpired => {},
@@ -721,6 +738,8 @@ fn idle(ev: *Evented) void {
             error.Unexpected,
             => |e| @panic(@errorName(e)),
         };
+
+        // handle completions
         var maybe_ready_queue: ?Fiber.Queue = null;
         while (true) {
             var cqes_buffer: [1 << 8]IoUring.Cqe = undefined;
@@ -728,10 +747,7 @@ fn idle(ev: *Evented) void {
             if (cqes.len == 0) break;
             for (cqes) |cqe| {
                 assert(!cqe.flags.skip);
-                switch (@as(
-                    Completion.Userdata,
-                    @fromBackingInt(@intCast(cqe.user_data)),
-                )) {
+                switch (@as(Completion.Userdata, @fromBackingInt(cqe.user_data))) {
                     .unused => unreachable, // bad submission queued?
                     .wakeup => {},
                     .futex_wake => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
@@ -746,58 +762,19 @@ fn idle(ev: *Evented) void {
                         .INTR => {}, // This is still a success. See https://github.com/ziglang/zig/issues/2425
                         else => {},
                     },
-                    .cleanup => @panic("failed to notify other threads that we are exiting"),
-                    _ => if (@as(?*Fiber, ready_fiber: switch (@as(u2, @truncate(cqe.user_data))) {
-                        // fiber
-                        0b00 => {
-                            const fiber: *Fiber = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
+                    _ => |userdata| if (@as(?*Fiber, ready_fiber: switch (userdata.flags()) {
+                        .fiber => {
+                            const fiber = userdata.pointer(*Fiber);
                             fiber.complete(cqe);
                             break :ready_fiber fiber;
                         },
-                        // batch timeout
-                        0b01 => {
-                            const batch: *Io.Batch = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
+                        .batch_timeout => {
+                            const batch = userdata.pointer(*Io.Batch);
                             break :ready_fiber batchTimeoutComplete(batch, cqe);
-                        },
-                        // batch operation
-                        0b10 => {
-                            // cqe.userdata points to pending operation
-                            const pending_userdata: *Io.Operation.Storage.Pending.Userdata =
-                                @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                            const batch: *Io.Batch = @ptrFromInt(pending_userdata[0]);
-                            const batch_userdata: *usize = @ptrCast(&batch.userdata);
-
-                            // batch.userdata holds pointer to the completed operation or batch fiber
-                            const next = batch_userdata.*;
-                            pending_userdata[0..3].* = .{ next, @as(u32, @bitCast(cqe.res)), @backingInt(cqe.flags) };
-                            batch_userdata.* = cqe.user_data;
-
-                            break :ready_fiber switch (@as(u2, @truncate(next))) {
-                                0b00, 0b01 => @ptrFromInt(next & ~@as(usize, 0b11)),
-                                0b10, 0b11 => null,
-                            };
-                        },
-                        // batch timeout
-                        0b11 => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
-                            .SUCCESS => unreachable, // no event count specified
-                            .TIME => {
-                                const batch_userdata: *usize = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                                const next = batch_userdata.*;
-                                batch_userdata.* += 0b01;
-                                break :ready_fiber switch (@as(u2, @truncate(next))) {
-                                    else => unreachable, // timeout completed multiple times
-                                    0b00 => @ptrFromInt(next & ~@as(usize, 0b11)),
-                                    0b10 => null,
-                                };
-                            },
-                            .CANCELED => null, // user data may have been invalidated
-                            else => |err| unexpectedErrno(err) catch null,
                         },
                     })) |ready_fiber| {
                         assert(ready_fiber.status.queue_next == null);
-                        if (maybe_ready_fiber == null) {
-                            maybe_ready_fiber = ready_fiber;
-                        } else if (maybe_ready_queue) |*ready_queue| {
+                        if (maybe_ready_queue) |*ready_queue| {
                             ready_queue.tail.status.queue_next = ready_fiber;
                             ready_queue.tail = ready_fiber;
                         } else maybe_ready_queue = .{ .head = ready_fiber, .tail = ready_fiber };
@@ -1420,157 +1397,50 @@ fn batchAwaitConcurrent(
 ) Io.Batch.AwaitConcurrentError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
-    if (batch.storage.len == 1) {
-        const index = batch.submitted.head;
-        const storage = &batch.storage[index.toIndex()];
-        if (@as(?Io.Operation.Result, result: switch (storage.submission.operation) {
-            .net_receive => |o| {
-                const recv_err, const message_i = ev.netReceiveTimeout(
-                    o.socket_handle,
-                    o.message_buffer,
-                    o.data_buffer,
-                    o.flags,
-                    timeout,
-                );
+    try ev.batchDrainSubmitted(batch);
+    if (batch.completed.head != .none or batch.pending.head == .none) return;
+    const fiber = ev.currentFiber();
 
-                break :result .{ .net_receive = .{ if (recv_err) |err| switch (err) {
-                    error.Timeout => |e| return e,
-                    else => |e| e,
-                } else null, message_i } };
-            },
-            else => unreachable,
-        })) |result| {
-            switch (batch.completed.tail) {
-                .none => batch.completed.head = index,
-                else => |tail_index| batch.storage[tail_index.toIndex()].completion.node.next = index,
+    // set timeout
+    const timeout_userdata: u64 = Completion.Userdata.pack(batch, .batch_timeout);
+    const maybe_timespec, const timeout_flags = timeoutToLinux(timeout);
+    if (maybe_timespec) |*timespec| {
+        const sqe, _ = try ev.enqueue();
+        sqe.timeout(timeout_userdata, timespec, 0, timeout_flags);
+    }
+
+    // wait for fiber wakeup from operation or timeout
+    var ud: BatchUserdata = .{ .fiber = fiber };
+    ud.pack(batch, .any);
+    ev.yield(null, .nothing);
+    ud = .unpack(batch);
+    assert(ud.flags == .by_timeout or ud.flags == .by_operation);
+
+    if (maybe_timespec) |_| {
+        if (ud.flags != .by_timeout) {
+            // remove timeout
+            const sqe = ev.getSqe();
+            sqe.timeoutRemove(@backingInt(Completion.Userdata.wakeup), timeout_userdata);
+            ud.pack(batch, .timeout);
+            ev.yield(null, .nothing);
+            ud = .unpack(batch);
+            assert(ud.flags == .by_timeout);
+            switch (fiber.errno()) {
+                .SUCCESS, .TIME => {},
+                .INTR => {},
+                .CANCELED => {},
+                .FAULT, .INVAL => |err| errnoBug(err) catch {},
+                else => |err| unexpectedErrno(err) catch {},
             }
-            batch.completed.tail = index;
-            storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
-        } else {
-            switch (batch.pending.tail) {
-                .none => batch.pending.head = index,
-                else => |tail_index| batch.storage[tail_index.toIndex()].pending.node.next = index,
-            }
-            batch.pending.tail = index;
-            storage.pending.userdata[0] = @intFromPtr(batch);
         }
-        return;
-    }
-
-    if (true) {
-        try ev.batchDrainSubmitted2(batch);
-        if (batch.completed.head != .none or batch.pending.head == .none) return;
-        const fiber = ev.currentFiber();
-
-        // set timeout
-        const timeout_userdata: u64 = @intFromPtr(batch) | 0b01;
-        const maybe_timespec, const timeout_flags = timeoutToLinux(timeout);
-        if (maybe_timespec) |*timespec| {
-            const sqe, _ = try ev.enqueue();
-            sqe.timeout(timeout_userdata, timespec, 0, timeout_flags);
+        if (batch.completed.head == .none and batch.pending.head != .none) {
+            if (batch.storage.len == 1) batchCancel(ev, batch); // TODO becasue Io.operateTimeout don't call cancel
+            return error.Timeout;
         }
-
-        var ud: BatchUserdata = .{ .fiber = fiber };
-        ud.pack(batch, .any);
-        ev.yield(null, .nothing);
-        ud = .unpack(batch);
-        assert(ud.flags == .by_timeout or ud.flags == .by_operation);
-
-        if (maybe_timespec) |_| {
-            if (ud.flags != .by_timeout) {
-                // remove timeout
-                const sqe = ev.getSqe();
-                sqe.timeoutRemove(@backingInt(Completion.Userdata.wakeup), timeout_userdata);
-                ud.pack(batch, .timeout);
-                ev.yield(null, .nothing);
-                ud = .unpack(batch);
-                assert(ud.flags == .by_timeout);
-                switch (fiber.errno()) {
-                    .SUCCESS, .TIME => {},
-                    .INTR => {},
-                    .CANCELED => {},
-                    .FAULT, .INVAL => |err| errnoBug(err) catch {},
-                    else => |err| unexpectedErrno(err) catch {},
-                }
-            }
-            if (batch.completed.head == .none and batch.pending.head != .none)
-                return error.Timeout;
-        }
-        return;
-    }
-
-    try ev.batchDrainSubmitted(batch, true);
-
-    const timespec: linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = while (true) {
-        batchDrainReady(batch) catch |err| switch (err) {
-            error.Timeout => unreachable, // no timeout
-        };
-        if (batch.completed.head != .none or batch.pending.head == .none) return;
-        switch (timeout) {
-            .none => ev.yield(null, .{ .batch_await = batch }),
-            .duration => |duration| {
-                const ns = duration.raw.toNanoseconds();
-                break .{
-                    .{
-                        .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
-                        .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
-                    },
-                    duration.clock,
-                    0,
-                };
-            },
-            .deadline => |deadline| {
-                const ns = deadline.raw.toNanoseconds();
-                break .{
-                    .{
-                        .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
-                        .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
-                    },
-                    deadline.clock,
-                    linux.IORING_TIMEOUT_ABS,
-                };
-            },
-        }
-    };
-    { // set timeout
-        ev.getSqe().timeout(
-            @intFromPtr(&batch.userdata) | 0b11,
-            &timespec,
-            0,
-            timeout_flags | @as(u32, switch (clock) {
-                .real => linux.IORING_TIMEOUT_REALTIME,
-                else => 0,
-                .boot => linux.IORING_TIMEOUT_BOOTTIME,
-            }),
-        );
-    }
-    while (batch.completed.head == .none and batch.pending.head != .none) {
-        ev.yield(null, .{ .batch_await = batch });
-        batchDrainReady(batch) catch |err| switch (err) {
-            error.Timeout => |e| return if (batch.completed.head == .none and
-                batch.pending.head != .none) e,
-        };
-    }
-    { // remove timeout
-        const sqe, const fiber = try ev.enqueue();
-        sqe.timeoutRemove(@intFromPtr(fiber), @intFromPtr(&batch.userdata) | 0b11);
-        ev.yield(null, .nothing);
-        switch (fiber.errno()) {
-            .SUCCESS => return,
-            .BUSY, .NOENT, .ALREADY => {}, // race between expiration and removal
-            else => |err| unexpectedErrno(err) catch {},
-        }
-    }
-    // drain timeout completion
-    while (true) {
-        batchDrainReady(batch) catch |err| switch (err) {
-            error.Timeout => return,
-        };
-        ev.yield(null, .{ .batch_await = batch });
     }
 }
 
-fn batchDrainSubmitted2(ev: *Evented, batch: *Io.Batch) (Io.ConcurrentError || Io.Cancelable)!void {
+fn batchDrainSubmitted(ev: *Evented, batch: *Io.Batch) (Io.ConcurrentError || Io.Cancelable)!void {
     var index = batch.submitted.head;
     if (index == .none) return;
     errdefer batch.submitted.head = index;
@@ -1588,7 +1458,7 @@ fn batchDrainSubmitted2(ev: *Evented, batch: *Io.Batch) (Io.ConcurrentError || I
         storage.* = .{ .pending = .{
             .node = .{ .prev = batch.pending.tail, .next = .none },
             .tag = operation,
-            .userdata = .{ @intFromPtr(batch), @intCast(index.toIndex()), 0, 0, 0, 0, 0 },
+            .userdata = .{ @intFromPtr(batch), @intCast(index.toIndex()), @intFromPtr(fiber), 0, 0, 0, 0 },
         } };
         // move batch operation to pending
         switch (batch.pending.tail) {
@@ -1671,222 +1541,25 @@ fn batchTimeoutComplete(batch: *Io.Batch, cqe: IoUring.Cqe) ?*Fiber {
     return if (ud.flags == .any or ud.flags == .timeout) ud.fiber else null;
 }
 
-/// If `concurrency` is false, `error.ConcurrencyUnavailable` is unreachable.
-fn batchDrainSubmitted(
-    ev: *Evented,
-    batch: *Io.Batch,
-    concurrency: bool,
-) (Io.ConcurrentError || Io.Cancelable)!void {
-    var index = batch.submitted.head;
-    if (index == .none) return;
-    errdefer batch.submitted.head = index;
-    while (index != .none) {
-        const storage = &batch.storage[index.toIndex()];
-        const next_index = storage.submission.node.next;
-        if (@as(?Io.Operation.Result, result: switch (storage.submission.operation) {
-            .file_read_streaming => |o| {
-                const buffer = for (o.data) |buffer| {
-                    if (buffer.len > 0) break buffer;
-                } else break :result .{ .file_read_streaming = 0 };
-                const fd = o.file.handle;
-                storage.* = .{ .pending = .{
-                    .node = .{ .prev = batch.pending.tail, .next = .none },
-                    .tag = .file_read_streaming,
-                    .userdata = undefined,
-                } };
-                ev.getSqe().read(
-                    @intFromPtr(&storage.pending.userdata) | 0b10,
-                    fd,
-                    buffer,
-                    null,
-                );
-                break :result null;
-            },
-            .file_write_streaming => |o| {
-                const buffer = buffer: {
-                    if (o.header.len != 0) break :buffer o.header;
-                    for (o.data[0 .. o.data.len - 1]) |buffer| {
-                        if (buffer.len > 0) break :buffer buffer;
-                    }
-                    if (o.splat > 0) break :buffer o.data[o.data.len - 1];
-                    break :result .{ .file_write_streaming = 0 };
-                };
-                const fd = o.file.handle;
-                storage.* = .{ .pending = .{
-                    .node = .{ .prev = batch.pending.tail, .next = .none },
-                    .tag = .file_write_streaming,
-                    .userdata = undefined,
-                } };
-                ev.getSqe().write(@intFromPtr(&storage.pending.userdata) | 0b10, fd, buffer, null);
-                break :result null;
-            },
-            .device_io_control => |o| if (concurrency)
-                return error.ConcurrencyUnavailable
-            else
-                .{ .device_io_control = try ev.deviceIoControl(o) },
-            .net_receive => |o| {
-                _ = o;
-                @panic("TODO implement batchDrainSubmitted for net_receive");
-            },
-            .net_read => |o| {
-                _ = o;
-                @panic("TODO implement batchDrainSubmitted for net_read");
-            },
-            .net_send => |o| {
-                _ = o;
-                @panic("TODO implement");
-            },
-            .net_write => |o| {
-                _ = o;
-                @panic("TODO implement");
-            },
-        })) |result| {
-            switch (batch.completed.tail) {
-                .none => batch.completed.head = index,
-                else => |tail_index| batch.storage[tail_index.toIndex()].completion.node.next = index,
-            }
-            batch.completed.tail = index;
-            storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
-        } else {
-            switch (batch.pending.tail) {
-                .none => batch.pending.head = index,
-                else => |tail_index| batch.storage[tail_index.toIndex()].pending.node.next = index,
-            }
-            batch.pending.tail = index;
-            storage.pending.userdata[0] = @intFromPtr(batch);
-        }
-        index = next_index;
-    }
-    batch.submitted = .{ .head = .none, .tail = .none };
-}
-
-fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
-    while (@atomicRmw(?*anyopaque, &batch.userdata, .Xchg, null, .acquire)) |head| {
-        var next: usize = @intFromPtr(head);
-        var timeout = false;
-        while (cond: switch (@as(u2, @truncate(next))) {
-            // next is ptr to the batch fiber
-            0b00 => if (timeout) return error.Timeout else false,
-            // next is ptr to the batch fiber and last completion was timeout
-            0b01 => {
-                assert(!timeout);
-                return error.Timeout;
-            },
-            // next is ptr to the operation
-            0b10 => true,
-            // next is ptr to the operation and last completion was timeout
-            0b11 => {
-                assert(!timeout);
-                timeout = true;
-                break :cond true;
-            },
-        }) {
-            const operation_userdata: *Io.Operation.Storage.Pending.Userdata =
-                @ptrFromInt(next & ~@as(usize, 0b11));
-            next = operation_userdata[0];
-            const completion: Completion = .{
-                .result = @bitCast(@as(u32, @intCast(operation_userdata[1]))),
-                .flags = @bitCast(@as(u32, @intCast(operation_userdata[2]))),
-            };
-
-            const pending: *Io.Operation.Storage.Pending =
-                @fieldParentPtr("userdata", operation_userdata);
-            const storage: *Io.Operation.Storage = @fieldParentPtr("pending", pending);
-            const index: Io.Operation.OptionalIndex = .fromIndex(storage - batch.storage.ptr);
-            switch (pending.node.prev) {
-                .none => batch.pending.head = pending.node.next,
-                else => |prev_index| batch.storage[prev_index.toIndex()].pending.node.next =
-                    pending.node.next,
-            }
-            switch (pending.node.next) {
-                .none => batch.pending.tail = pending.node.prev,
-                else => |prev_index| batch.storage[prev_index.toIndex()].pending.node.prev =
-                    pending.node.prev,
-            }
-            if (@as(?Io.Operation.Result, result: switch (pending.tag) {
-                .file_read_streaming => .{
-                    .file_read_streaming = switch (completion.errno()) {
-                        .SUCCESS => @as(u32, @bitCast(completion.result)),
-                        .INTR => 0,
-                        .CANCELED => break :result null,
-                        .INVAL => |err| errnoBug(err),
-                        .FAULT => |err| errnoBug(err),
-                        .AGAIN => error.WouldBlock,
-                        .BADF => |err| errnoBug(err), // File descriptor used after closed
-                        .IO => error.InputOutput,
-                        .ISDIR => error.IsDir,
-                        .NOBUFS => error.SystemResources,
-                        .NOMEM => error.SystemResources,
-                        .NOTCONN => error.SocketUnconnected,
-                        .CONNRESET => error.ConnectionResetByPeer,
-                        else => |err| unexpectedErrno(err),
-                    },
-                },
-                .file_write_streaming => .{
-                    .file_write_streaming = switch (completion.errno()) {
-                        .SUCCESS => @as(u32, @bitCast(completion.result)),
-                        .INTR => 0,
-                        .CANCELED => break :result null,
-                        .INVAL => |err| errnoBug(err),
-                        .FAULT => |err| errnoBug(err),
-                        .AGAIN => error.WouldBlock,
-                        .BADF => error.NotOpenForWriting, // Can be a race condition.
-                        .DESTADDRREQ => |err| errnoBug(err), // `connect` was never called.
-                        .DQUOT => error.DiskQuota,
-                        .FBIG => error.FileTooBig,
-                        .IO => error.InputOutput,
-                        .NOSPC => error.NoSpaceLeft,
-                        .PERM => error.PermissionDenied,
-                        .PIPE => error.BrokenPipe,
-                        .CONNRESET => |err| errnoBug(err), // Not a socket handle.
-                        .BUSY => error.DeviceBusy,
-                        else => |err| unexpectedErrno(err),
-                    },
-                },
-                .device_io_control => unreachable,
-                .net_receive => @panic("TODO"),
-                .net_read => @panic("TODO"),
-                .net_send => @panic("TODO"),
-                .net_write => @panic("TODO"),
-            })) |result| {
-                switch (batch.completed.tail) {
-                    .none => batch.completed.head = index,
-                    else => |tail_index| batch.storage[tail_index.toIndex()].completion.node.next =
-                        index,
-                }
-                storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
-                batch.completed.tail = index;
-            } else {
-                switch (batch.unused.tail) {
-                    .none => batch.unused.head = index,
-                    else => |tail_index| batch.storage[tail_index.toIndex()].unused.next = index,
-                }
-                storage.* = .{ .unused = .{ .prev = batch.unused.tail, .next = .none } };
-                batch.unused.tail = index;
-            }
-        }
-    }
-}
-
 fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    batchDrainReady(batch) catch |err| switch (err) {
-        error.Timeout => unreachable, // no timeout
-    };
     var index = batch.pending.head;
     if (index == .none) return;
-
+    // cancel all pending operations
     while (index != .none) {
         const pending = &batch.storage[index.toIndex()].pending;
         ev.getSqe().asyncCancel(
             @backingInt(Completion.Userdata.wakeup),
-            @intFromPtr(&pending.userdata) | 0b10,
+            pending.userdata[2],
         );
         index = pending.node.next;
     }
-    while (batch.pending.head != .none) batchDrainReady(batch) catch |err| switch (err) {
-        error.Timeout => unreachable, // no timeout
-    };
+    // wait for operations to finish
+    const ud: BatchUserdata = .unpack(batch);
+    while (batch.pending.head != .none) {
+        ud.pack(batch, .any);
+        ev.yield(null, .nothing);
+    }
 }
 
 fn dirCreateDir(
@@ -4106,7 +3779,7 @@ fn netReceive(
     const recv_err, const recv_n = netReceiveTimeout(ev, handle, message_buffer, data_buffer, flags, .none);
     return .{
         if (recv_err) |err| switch (err) {
-            error.Timeout => unreachable,
+            error.Timeout => error.Canceled,
             else => |e| e,
         } else null,
         recv_n,
@@ -4177,7 +3850,8 @@ fn netReceiveTimeout(
             // recv with msg.dontwait completed without new data
             .AGAIN => return .{ null, message_i },
             // timeout expired
-            .CANCELED => if (timeout != .none) return .{ error.Timeout, message_i },
+            //.CANCELED => if (timeout != .none) return .{ error.Timeout, message_i },
+            .CANCELED => return .{ error.Timeout, message_i },
             .INTR => {},
             .BADF => |err| return .{ errnoBug(err), message_i },
             .NFILE => return .{ error.SystemFdQuotaExceeded, message_i },
