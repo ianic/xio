@@ -932,3 +932,56 @@ test "reuse group, awaiter is not cleared in removeFiber" {
     grp.async(io, Io.sleep, .{ io, .fromMilliseconds(1), .real });
     try grp.await(io);
 }
+
+test "operateTimeout should cancel Batch on error" {
+    const gpa = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = tmp.dir;
+
+    // var threaded = Io.Threaded.init(gpa, .{});
+    // defer threaded.deinit();
+    // const io = threaded.io();
+
+    // var ev: Io.Uring = undefined;
+    // try ev.init(gpa, .{});
+    // defer ev.deinit();
+    // const io = ev.io();
+
+    var ev: Evented = undefined;
+    try ev.init(gpa, .{});
+    defer ev.deinit();
+    const io = ev.io();
+
+    const f = try dir.createFile(io, "file1", .{});
+    defer f.close(io);
+
+    const timeout: Io.Timeout = .{ .duration = .{ .clock = .real, .raw = .fromNanoseconds(1) } };
+    for (0..128) |_| {
+        const op: Io.Operation = .{ .file_write_streaming = .{ .file = f, .data = &[_][]const u8{"foo bar"} } };
+        const res = io.operateTimeout(op, timeout) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => |e| return e,
+        };
+        try testing.expectEqual(7, try res.file_write_streaming);
+    }
+}
+
+fn operateTimeout(io: Io, operation: Io.Operation, timeout: Io.Timeout) Io.OperateTimeoutError!Io.Operation.Result {
+    if (timeout == .none) return io.vtable.operate(io.userdata, operation);
+    var storage: [1]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+    batch.addAt(0, operation);
+    batch.awaitConcurrent(io, timeout) catch |err| {
+        batch.cancel(io);
+        if (batch.next()) |completion| {
+            assert(completion.index == 0);
+            return completion.result;
+        }
+        return err;
+    };
+    const completion = batch.next().?;
+    assert(completion.index == 0);
+    return completion.result;
+}
