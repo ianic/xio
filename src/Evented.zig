@@ -67,7 +67,6 @@ stderr_writer: File.Writer = .{
 },
 stderr_mode: Io.Terminal.Mode = .no_color,
 
-environ_mutex: Io.Mutex,
 environ_initialized: bool,
 environ: Environ,
 
@@ -489,7 +488,6 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         },
         .stderr_mode = .no_color,
 
-        .environ_mutex = .init,
         .environ_initialized = options.environ.block.isEmpty(),
         .environ = .{ .process_environ = options.environ },
 
@@ -1434,8 +1432,11 @@ fn batchAwaitConcurrent(
             }
         }
         if (batch.completed.head == .none and batch.pending.head != .none) {
-            if (batch.storage.len == 1) batchCancel(ev, batch); // TODO becasue Io.operateTimeout don't call cancel
-            return error.Timeout;
+            if (batch.storage.len == 1) { // TODO becasue Io.operateTimeout don't call cancel
+                batchCancel(ev, batch);
+                if (batch.completed.head == .none)
+                    return error.Timeout;
+            }
         }
     }
 }
@@ -1560,6 +1561,7 @@ fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
         ud.pack(batch, .any);
         ev.yield(null, .nothing);
     }
+    batch.userdata = null;
 }
 
 fn dirCreateDir(
@@ -2836,11 +2838,7 @@ fn tryLockStderr(
 fn initLockedStderr(ev: *Evented, terminal_mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
     if (!ev.stderr_writer_initialized) {
         const ev_io = ev.io();
-        const cancel_protection = swapCancelProtection(ev, .blocked);
-        defer assert(swapCancelProtection(ev, cancel_protection) == .blocked);
-        ev.scanEnviron() catch |err| switch (err) {
-            error.Canceled => unreachable, // blocked
-        };
+        ev.scanEnviron();
         const NO_COLOR = ev.environ.exist.NO_COLOR;
         const CLICOLOR_FORCE = ev.environ.exist.CLICOLOR_FORCE;
         ev.stderr_mode = Io.Terminal.Mode.detect(
@@ -2908,7 +2906,7 @@ fn processSetCurrentPath(userdata: ?*anyopaque, dir_path: []const u8) process.Se
 fn processReplace(userdata: ?*anyopaque, options: process.ReplaceOptions) process.ReplaceError {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
-    try ev.scanEnviron(); // for PATH
+    ev.scanEnviron(); // for PATH
     const PATH = ev.environ.string.PATH orelse default_PATH;
 
     var arena_allocator = std.heap.ArenaAllocator.init(ev.backing_allocator);
@@ -3071,7 +3069,7 @@ fn spawn(ev: *Evented, options: process.SpawnOptions) process.SpawnError!Spawned
     const err_pipe: [2]fd_t = try pipe2Sync(.{ .CLOEXEC = true });
     errdefer ev.destroyPipe(err_pipe);
 
-    try ev.scanEnviron(); // for PATH
+    ev.scanEnviron(); // for PATH
     const PATH = ev.environ.string.PATH orelse default_PATH;
 
     const pid_result: pid_t = fork: {
@@ -3478,18 +3476,11 @@ fn childCleanup(ev: *Evented, child: *process.Child) void {
 
 fn progressParentFile(userdata: ?*anyopaque) std.Progress.ParentFileError!File {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const cancel_protection = swapCancelProtection(ev, .blocked);
-    defer assert(swapCancelProtection(ev, cancel_protection) == .blocked);
-    ev.scanEnviron() catch |err| switch (err) {
-        error.Canceled => unreachable, // blocked
-    };
+    ev.scanEnviron();
     return ev.environ.zig_progress_file;
 }
 
-fn scanEnviron(ev: *Evented) Io.Cancelable!void {
-    const ev_io = ev.io();
-    try ev.environ_mutex.lock(ev_io);
-    defer ev.environ_mutex.unlock(ev_io);
+fn scanEnviron(ev: *Evented) void {
     if (ev.environ_initialized) return;
     ev.environ.scan(ev.backing_allocator);
     ev.environ_initialized = true;
