@@ -1181,44 +1181,13 @@ fn futexWait(
     timeout: Io.Timeout,
 ) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const timespec: ?linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = timespec: switch (timeout) {
-        .none => .{
-            null,
-            .awake,
-            linux.IORING_TIMEOUT_ABS,
-        },
-        .duration => |duration| {
-            const ns = duration.raw.toNanoseconds();
-            break :timespec .{
-                .{
-                    .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
-                    .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
-                },
-                duration.clock,
-                0,
-            };
-        },
-        .deadline => |deadline| {
-            const ns = deadline.raw.toNanoseconds();
-            break :timespec .{
-                .{
-                    .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
-                    .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
-                },
-                deadline.clock,
-                linux.IORING_TIMEOUT_ABS,
-            };
-        },
-    };
+    const timespec, const timeout_flags = timeoutToLinux(timeout);
+
     const sqe, const fiber = try ev.enqueue();
     sqe.futexWait(@intFromPtr(fiber), ptr, expected);
     if (timespec) |*timespec_ptr| {
         sqe.flags.io_link = true;
-        sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), timespec_ptr, timeout_flags | @as(u32, switch (clock) {
-            .real => linux.IORING_TIMEOUT_REALTIME,
-            else => 0,
-            .boot => linux.IORING_TIMEOUT_BOOTTIME,
-        }));
+        sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), timespec_ptr, timeout_flags);
         sqe.flags.cqe_skip_success = true;
     }
     ev.yield(null, .nothing);
@@ -3510,46 +3479,17 @@ fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
 
 fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-
-    const timespec: linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = timespec: switch (timeout) {
-        .none => .{
-            .{
-                .sec = std.math.maxInt(i64),
-                .nsec = std.time.ns_per_s - 1,
-            },
-            .awake,
-            linux.IORING_TIMEOUT_ABS,
-        },
-        .duration => |duration| {
-            const ns = duration.raw.toNanoseconds();
-            break :timespec .{
-                .{
-                    .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
-                    .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
-                },
-                duration.clock,
-                0,
-            };
-        },
-        .deadline => |deadline| {
-            const ns = deadline.raw.toNanoseconds();
-            break :timespec .{
-                .{
-                    .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
-                    .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
-                },
-                deadline.clock,
-                linux.IORING_TIMEOUT_ABS,
-            };
-        },
+    const maybe_timespec, var flags = timeoutToLinux(timeout);
+    const timespec: linux.kernel_timespec = if (maybe_timespec) |ts| ts else brk: {
+        flags = linux.IORING_TIMEOUT_ABS;
+        break :brk .{
+            .sec = std.math.maxInt(i64),
+            .nsec = std.time.ns_per_s - 1,
+        };
     };
 
     const sqe, const fiber = try ev.enqueue();
-    sqe.timeout(@intFromPtr(fiber), &timespec, 0, timeout_flags | @as(u32, switch (clock) {
-        .real => linux.IORING_TIMEOUT_REALTIME,
-        else => 0,
-        .boot => linux.IORING_TIMEOUT_BOOTTIME,
-    }));
+    sqe.timeout(@intFromPtr(fiber), &timespec, 0, flags);
     ev.yield(null, .nothing);
     switch (fiber.errno()) {
         .SUCCESS, .TIME => {},
