@@ -394,8 +394,8 @@ pub fn io(ev: *Evented) Io {
             .fileLength = fileLength,
             .fileClose = fileClose,
             .fileWritePositional = fileWritePositional,
-            .fileWriteFileStreaming = fileWriteFileStreaming,
-            .fileWriteFilePositional = fileWriteFilePositional,
+            .fileWriteFileStreaming = fileWriteFileStreamingUnavailable,
+            .fileWriteFilePositional = fileWriteFilePositionalUnavailable,
             .fileReadPositional = fileReadPositional,
             .fileSeekBy = fileSeekBy,
             .fileSeekTo = fileSeekTo,
@@ -417,8 +417,8 @@ pub fn io(ev: *Evented) Io {
             .fileMemoryMapCreate = fileMemoryMapCreate,
             .fileMemoryMapDestroy = fileMemoryMapDestroy,
             .fileMemoryMapSetLength = fileMemoryMapSetLength,
-            .fileMemoryMapRead = fileMemoryMapRead,
-            .fileMemoryMapWrite = fileMemoryMapWrite,
+            .fileMemoryMapRead = fileMemoryMapReadUnavailable,
+            .fileMemoryMapWrite = fileMemoryMapWriteUnavailable,
 
             .processExecutableOpen = processExecutableOpen,
             .processExecutablePath = processExecutablePath,
@@ -431,7 +431,7 @@ pub fn io(ev: *Evented) Io {
             .processReplace = processReplace,
             .processReplacePath = processReplacePath,
             .processSpawn = processSpawn,
-            .processSpawnPath = processSpawnPath,
+            .processSpawnPath = processSpawnPathUnavailable,
             .childWait = childWait,
             .childKill = childKill,
 
@@ -1181,13 +1181,12 @@ fn futexWait(
     timeout: Io.Timeout,
 ) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const timespec, const timeout_flags = timeoutToLinux(timeout);
-
+    const timespec, const timespec_flags = timeoutToLinux(timeout);
     const sqe, const fiber = try ev.enqueue();
     sqe.futexWait(@intFromPtr(fiber), ptr, expected);
-    if (timespec) |*timespec_ptr| {
+    if (timeout != .null) {
         sqe.flags.io_link = true;
-        sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), timespec_ptr, timeout_flags);
+        sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), &timespec, timespec_flags);
         sqe.flags.cqe_skip_success = true;
     }
     ev.yield(null, .nothing);
@@ -1363,6 +1362,7 @@ fn batchAwaitConcurrent(
     timeout: Io.Timeout,
 ) Io.Batch.AwaitConcurrentError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
+    const timespec, const timespec_flags = timeoutToLinux(timeout);
 
     try ev.batchDrainSubmitted(batch);
     if (batch.completed.head != .none or batch.pending.head == .none) return;
@@ -1370,10 +1370,9 @@ fn batchAwaitConcurrent(
 
     // set timeout
     const timeout_userdata: u64 = Completion.Userdata.pack(batch, .batch_timeout);
-    const maybe_timespec, const timeout_flags = timeoutToLinux(timeout);
-    if (maybe_timespec) |*timespec| {
+    if (timeout != .null) {
         const sqe, _ = try ev.enqueue();
-        sqe.timeout(timeout_userdata, timespec, 0, timeout_flags);
+        sqe.timeout(timeout_userdata, &timespec, 0, timespec_flags);
     }
 
     // wait for fiber wakeup from operation or timeout
@@ -1383,7 +1382,7 @@ fn batchAwaitConcurrent(
     ud = .unpack(batch);
     assert(ud.flags == .by_timeout or ud.flags == .by_operation);
 
-    if (maybe_timespec) |_| {
+    if (timeout != .null) {
         if (ud.flags != .by_timeout) {
             // remove timeout
             const sqe = ev.getSqe();
@@ -2425,7 +2424,7 @@ fn fileWritePositional(
     return ev.pwritev(file.handle, header, data, splat, offset);
 }
 
-fn fileWriteFileStreaming(
+fn fileWriteFileStreamingUnavailable(
     userdata: ?*anyopaque,
     file: File,
     header: []const u8,
@@ -2441,7 +2440,7 @@ fn fileWriteFileStreaming(
     return error.Unimplemented;
 }
 
-fn fileWriteFilePositional(
+fn fileWriteFilePositionalUnavailable(
     userdata: ?*anyopaque,
     file: File,
     header: []const u8,
@@ -2755,13 +2754,13 @@ fn fileMemoryMapSetLength(
     mm.memory = new_memory;
 }
 
-fn fileMemoryMapRead(userdata: ?*anyopaque, mm: *File.MemoryMap) File.ReadPositionalError!void {
+fn fileMemoryMapReadUnavailable(userdata: ?*anyopaque, mm: *File.MemoryMap) File.ReadPositionalError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
     _ = mm;
 }
 
-fn fileMemoryMapWrite(userdata: ?*anyopaque, mm: *File.MemoryMap) File.WritePositionalError!void {
+fn fileMemoryMapWriteUnavailable(userdata: ?*anyopaque, mm: *File.MemoryMap) File.WritePositionalError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
     _ = mm;
@@ -2943,7 +2942,7 @@ fn processSpawn(userdata: ?*anyopaque, options: process.SpawnOptions) process.Sp
     return child_err;
 }
 
-fn processSpawnPath(
+fn processSpawnPathUnavailable(
     userdata: ?*anyopaque,
     dir: Dir,
     options: process.SpawnOptions,
@@ -3479,17 +3478,9 @@ fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
 
 fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const maybe_timespec, var flags = timeoutToLinux(timeout);
-    const timespec: linux.kernel_timespec = if (maybe_timespec) |ts| ts else brk: {
-        flags = linux.IORING_TIMEOUT_ABS;
-        break :brk .{
-            .sec = std.math.maxInt(i64),
-            .nsec = std.time.ns_per_s - 1,
-        };
-    };
-
     const sqe, const fiber = try ev.enqueue();
-    sqe.timeout(@intFromPtr(fiber), &timespec, 0, flags);
+    const timespec, const timespec_flags = timeoutToLinux(timeout);
+    sqe.timeout(@intFromPtr(fiber), &timespec, 0, timespec_flags);
     ev.yield(null, .nothing);
     switch (fiber.errno()) {
         .SUCCESS, .TIME => {},
@@ -3617,8 +3608,7 @@ fn netConnectIp(
     errdefer ev.closeAsync(socket_fd);
     var storage: PosixAddress = undefined;
     var addr_len = addressToPosix(address, &storage);
-    const timeout, const timeout_flags = timeoutToLinux(options.timeout);
-    try ev.connect(socket_fd, &storage.any, addr_len, timeout, timeout_flags);
+    try ev.connect(socket_fd, &storage.any, addr_len, options.timeout);
     try ev.getsockname(socket_fd, &storage.any, &addr_len);
     return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
 }
@@ -3725,6 +3715,7 @@ fn netReceiveTimeout(
     flags: net.ReceiveFlags,
     timeout: Io.Timeout,
 ) struct { ?(net.Socket.ReceiveError || error{Timeout}), usize } {
+    const timespec, const timespec_flags = timeoutToLinux(timeout);
     var message_i: usize = 0;
     var data_i: usize = 0;
     while (true) {
@@ -3752,7 +3743,6 @@ fn netReceiveTimeout(
 
         if (timeout != .none and message_i == 0) {
             sqe.flags.io_link = true;
-            const timespec, const timespec_flags = timeoutToLinux(timeout);
             sqe = ev.getSqe();
             sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), &timespec.?, timespec_flags);
             sqe.flags.cqe_skip_success = true;
@@ -4198,16 +4188,16 @@ fn connect(
     fd: fd_t,
     addr: *const linux.sockaddr,
     addr_len: linux.socklen_t,
-    timeout: ?linux.kernel_timespec,
-    timeout_flags: u32,
+    timeout: Io.Timeout,
 ) !void {
+    const timespec, const timespec_flags = timeoutToLinux(timeout);
     while (true) {
         var sqe, const fiber = try ev.enqueue();
         sqe.connect(@intFromPtr(fiber), fd, addr, addr_len);
-        if (timeout) |*timespec_ptr| {
+        if (timeout != .null) {
             sqe.flags.io_link = true;
             sqe = ev.getSqe();
-            sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), timespec_ptr, timeout_flags);
+            sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), &timespec, timespec_flags);
             sqe.flags.cqe_skip_success = true;
         }
         ev.yield(null, .nothing);
@@ -5016,9 +5006,15 @@ fn splice(
     }
 }
 
-fn timeoutToLinux(timeout: Io.Timeout) struct { ?linux.kernel_timespec, u32 } {
+fn timeoutToLinux(timeout: Io.Timeout) struct { linux.kernel_timespec, u32 } {
     const ns: i96, const clock: Io.Clock, const flags: u32 = switch (timeout) {
-        .none => return .{ null, 0 },
+        .none => return .{
+            .{
+                .sec = std.math.maxInt(i64),
+                .nsec = std.time.ns_per_s - 1,
+            },
+            linux.IORING_TIMEOUT_ABS,
+        },
         .duration => |duration| .{ duration.raw.toNanoseconds(), duration.clock, 0 },
         .deadline => |deadline| .{ deadline.raw.toNanoseconds(), deadline.clock, linux.IORING_TIMEOUT_ABS },
     };
