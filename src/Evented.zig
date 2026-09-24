@@ -267,25 +267,6 @@ const Fiber = struct {
 
     const Queue = struct { head: *Fiber, tail: *Fiber };
 
-    /// Like a `*Fiber`, but 2 bits smaller than a pointer (because the LSBs are always 0 due to
-    /// alignment) so that those two bits can be used in a `packed struct`.
-    const PackedPtr = enum(@Int(.unsigned, @bitSizeOf(usize) - 2)) {
-        null = 0,
-        all_ones = std.math.maxInt(@Int(.unsigned, @bitSizeOf(usize) - 2)),
-        _,
-
-        const Split = packed struct(usize) { low: u2, high: PackedPtr };
-        fn pack(ptr: ?*Fiber) PackedPtr {
-            const split: Split = @bitCast(@intFromPtr(ptr));
-            assert(split.low == 0);
-            return split.high;
-        }
-        fn unpack(ptr: PackedPtr) ?*Fiber {
-            const split: Split = .{ .low = 0, .high = ptr };
-            return @ptrFromInt(@as(usize, @bitCast(split)));
-        }
-    };
-
     fn requestCancel(fiber: *Fiber, ev: *Evented) void {
         assert(!fiber.cancel_status.requested);
         fiber.cancel_status.requested = true;
@@ -429,7 +410,7 @@ pub fn io(ev: *Evented) Io {
             .processSetCurrentDir = processSetCurrentDir,
             .processSetCurrentPath = processSetCurrentPath,
             .processReplace = processReplace,
-            .processReplacePath = processReplacePath,
+            .processReplacePath = processReplacePathUnavailable,
             .processSpawn = processSpawn,
             .processSpawnPath = processSpawnPathUnavailable,
             .childWait = childWait,
@@ -1184,7 +1165,7 @@ fn futexWait(
     const timespec, const timespec_flags = timeoutToLinux(timeout);
     const sqe, const fiber = try ev.enqueue();
     sqe.futexWait(@intFromPtr(fiber), ptr, expected);
-    if (timeout != .null) {
+    if (timeout != .none) {
         sqe.flags.io_link = true;
         sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), &timespec, timespec_flags);
         sqe.flags.cqe_skip_success = true;
@@ -1370,7 +1351,7 @@ fn batchAwaitConcurrent(
 
     // set timeout
     const timeout_userdata: u64 = Completion.Userdata.pack(batch, .batch_timeout);
-    if (timeout != .null) {
+    if (timeout != .none) {
         const sqe, _ = try ev.enqueue();
         sqe.timeout(timeout_userdata, &timespec, 0, timespec_flags);
     }
@@ -1382,7 +1363,7 @@ fn batchAwaitConcurrent(
     ud = .unpack(batch);
     assert(ud.flags == .by_timeout or ud.flags == .by_operation);
 
-    if (timeout != .null) {
+    if (timeout != .none) {
         if (ud.flags != .by_timeout) {
             // remove timeout
             const sqe = ev.getSqe();
@@ -2898,7 +2879,7 @@ fn processReplace(userdata: ?*anyopaque, options: process.ReplaceOptions) proces
     return execv(options.expand_arg0, argv_buf.ptr[0].?, argv_buf.ptr, env_block, PATH);
 }
 
-fn processReplacePath(
+fn processReplacePathUnavailable(
     userdata: ?*anyopaque,
     dir: Dir,
     options: process.ReplaceOptions,
@@ -3744,7 +3725,7 @@ fn netReceiveTimeout(
         if (timeout != .none and message_i == 0) {
             sqe.flags.io_link = true;
             sqe = ev.getSqe();
-            sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), &timespec.?, timespec_flags);
+            sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), &timespec, timespec_flags);
             sqe.flags.cqe_skip_success = true;
         }
 
@@ -3771,7 +3752,6 @@ fn netReceiveTimeout(
             // recv with msg.dontwait completed without new data
             .AGAIN => return .{ null, message_i },
             // timeout expired
-            //.CANCELED => if (timeout != .none) return .{ error.Timeout, message_i },
             .CANCELED => return .{ error.Timeout, message_i },
             .INTR => {},
             .BADF => |err| return .{ errnoBug(err), message_i },
@@ -4194,7 +4174,7 @@ fn connect(
     while (true) {
         var sqe, const fiber = try ev.enqueue();
         sqe.connect(@intFromPtr(fiber), fd, addr, addr_len);
-        if (timeout != .null) {
+        if (timeout != .none) {
             sqe.flags.io_link = true;
             sqe = ev.getSqe();
             sqe.linkTimeout(@backingInt(Completion.Userdata.wakeup), &timespec, timespec_flags);
@@ -4869,21 +4849,7 @@ fn writeSync(fd: fd_t, buffer: []const u8) File.Writer.Error!usize {
         switch (linux.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => {},
-            .INVAL => |err| return errnoBug(err),
-            .FAULT => |err| return errnoBug(err),
-            .AGAIN => return error.WouldBlock,
-            .BADF => return error.NotOpenForWriting, // Can be a race condition.
-            .DESTADDRREQ => |err| return errnoBug(err), // `connect` was never called.
-            .DQUOT => return error.DiskQuota,
-            .FBIG => return error.FileTooBig,
-            .IO => return error.InputOutput,
-            .NOSPC => return error.NoSpaceLeft,
-            .PERM => return error.PermissionDenied,
-            .PIPE => return error.BrokenPipe,
-            .CONNRESET => |err| return errnoBug(err), // Not a socket handle.
-            .BUSY => return error.DeviceBusy,
-            .ACCES => return error.AccessDenied,
-            else => |err| return unexpectedErrno(err),
+            else => |errno| return errnoToError(File.Writer.Error, errno),
         }
     }
 }
@@ -5215,10 +5181,6 @@ fn errnoToError(comptime ErrorSet: type, errno: linux.E) ErrorSet {
     };
 }
 
-test {
-    _ = Fiber.CancelProtection;
-}
-
 fn lookupHosts(
     ev: *Evented,
     host_name: HostName,
@@ -5330,4 +5292,8 @@ fn copyCanon(canonical_name_buffer: ?*[HostName.max_len]u8, name: []const u8) ?H
     const dest = buf[0..name.len];
     @memcpy(dest, name);
     return .{ .bytes = dest };
+}
+
+test {
+    _ = Fiber.CancelProtection;
 }
